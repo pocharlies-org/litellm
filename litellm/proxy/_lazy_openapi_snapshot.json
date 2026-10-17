@@ -21530,6 +21530,21 @@
           "title": "Click",
           "type": "object"
         },
+        "ClientToolSearchChoice": {
+          "additionalProperties": true,
+          "properties": {
+            "type": {
+              "const": "tool_search",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "ClientToolSearchChoice",
+          "type": "object"
+        },
         "CodeInterpreter": {
           "additionalProperties": true,
           "description": "A tool that runs Python code to help generate a response to a prompt.",
@@ -22044,6 +22059,17 @@
             "name": {
               "title": "Name",
               "type": "string"
+            },
+            "namespace": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Namespace"
             },
             "status": {
               "anyOf": [
@@ -26746,6 +26772,9 @@
                         "$ref": "#/components/schemas/GenericResponseOutputItem"
                       },
                       {
+                        "$ref": "#/components/schemas/ResponseReasoningItem"
+                      },
+                      {
                         "$ref": "#/components/schemas/OutputCodeInterpreterCall"
                       },
                       {
@@ -26762,6 +26791,9 @@
                       },
                       {
                         "$ref": "#/components/schemas/CustomToolCallOutputItem"
+                      },
+                      {
+                        "$ref": "#/components/schemas/ResponseToolSearchCall"
                       }
                     ]
                   },
@@ -26882,6 +26914,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolChoiceShellParam"
+                },
+                {
+                  "$ref": "#/components/schemas/ClientToolSearchChoice"
                 },
                 {
                   "type": "null"
