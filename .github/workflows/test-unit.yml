@@ -132,6 +132,7 @@ jobs:
               --ignore=tests/unit/proxy/auth/test_proxy_routes.py
               --ignore=tests/unit/proxy/hooks/test_banned_keyword_list.py
               --ignore=tests/unit/proxy/hooks/test_unit_test_max_model_budget_limiter.py
+              tests/local_testing/test_realtime_call_redis.py
             workers: 2
             reruns: 2
             timeout-minutes: 20
