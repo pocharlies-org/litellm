@@ -61,7 +61,6 @@ BACKEND_PATH_PREFIXES: tuple[str, ...] = (
     "/v1/tool/",
     "/v1/agents",
     "/agent/daily/activity/",
-    "/v1/traces",
     # Guardrails admin
     "/v2/guardrails/",
     # MCP server admin + BYOK OAuth flow (UI-initiated) + dynamic per-server endpoints
