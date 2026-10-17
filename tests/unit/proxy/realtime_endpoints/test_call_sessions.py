@@ -140,7 +140,7 @@ async def test_mixed_case_offer_preserves_boundary_metadata_and_closes_extra_fil
         return {"type": "http.request", "body": body, "more_body": False}
 
     request = Request(
-        {"type": "http", "headers": [(b"content-type", f'Multipart/Form-Data; boundary="{boundary}"'.encode())]},
+        {"type": "http", "method": "POST", "path": "/v1/realtime/calls", "headers": [(b"content-type", f'Multipart/Form-Data; boundary="{boundary}"'.encode())]},
         receive,
     )
     assert not await request.form()
