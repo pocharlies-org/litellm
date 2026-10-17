@@ -71,7 +71,9 @@ class TestCustomToolUtilities:
         ]
 
         names = extract_custom_tool_names(tools)
-        assert names == {"exec"}
+        # litellm fork: custom tools inside a namespace are recognised under their bare name
+        # and under the flattened name, because providers may echo either form back.
+        assert names == {"exec", "functions__exec"}
 
     def test_extract_custom_tool_names_none(self):
         """Test extraction with None input."""

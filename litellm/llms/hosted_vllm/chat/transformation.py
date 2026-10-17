@@ -3,9 +3,11 @@ Translate from OpenAI's `/v1/chat/completions` to VLLM's `/v1/chat/completions`
 """
 
 import json
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping
 from copy import deepcopy
 from typing import Final, Literal, cast, overload
+
+from pydantic import BaseModel, TypeAdapter
 
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     _get_image_mime_type_from_url,
@@ -23,6 +25,7 @@ from litellm.types.llms.openai import (
     AllMessageValues,
     ChatCompletionAssistantToolCall,
     ChatCompletionFileObject,
+    ChatCompletionSystemMessage,
     ChatCompletionToolCallFunctionChunk,
     ChatCompletionVideoObject,
     ChatCompletionVideoUrlObject,
@@ -30,6 +33,38 @@ from litellm.types.llms.openai import (
 
 from ....utils import _remove_additional_properties, _remove_strict_from_schema
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
+from ..reasoning_policy import get_model_group, normalize_deepseek_v4_reasoning_effort
+
+_THINKING_DISABLED_MARKER: Final = "_hosted_vllm_thinking_disabled"
+
+_MESSAGES_ADAPTER: Final = TypeAdapter(list[dict[str, object]])
+
+
+class _SystemTextBlock(BaseModel):
+    type: Literal["text"]
+    text: str
+
+
+_SYSTEM_CONTENT_ADAPTER: Final = TypeAdapter(str | list[_SystemTextBlock])
+
+
+def _system_message_text(content: object) -> str:
+    parsed: Final = _SYSTEM_CONTENT_ADAPTER.validate_python(content)
+    return parsed if isinstance(parsed, str) else "\n".join(block.text for block in parsed)
+
+
+def _merge_system_messages(messages: object) -> tuple[Mapping[str, object], ...]:
+    parsed: Final = _MESSAGES_ADAPTER.validate_python(messages)
+    instructions: Final = tuple(message for message in parsed if message.get("role") in ("system", "developer"))
+    if not instructions:
+        return tuple(parsed)
+    merged: Final = ChatCompletionSystemMessage(
+        role="system", content="\n\n".join(_system_message_text(message.get("content")) for message in instructions)
+    )
+    return (
+        merged,
+        *(message for message in parsed if message.get("role") not in ("system", "developer")),
+    )
 
 
 class HostedVLLMChatConfig(OpenAIGPTConfig):
@@ -101,6 +136,7 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
             non_default_params["tools"] = _tools
 
         thinking: Final = non_default_params.pop("thinking", None)
+        thinking_disabled: Final = isinstance(thinking, dict) and thinking.get("type") == "disabled"
         if thinking is not None and isinstance(thinking, dict):
             if thinking.get("type") == "enabled":
                 if "reasoning_effort" not in non_default_params:
@@ -108,7 +144,99 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
                         thinking.get("budget_tokens", 0)
                     )
 
-        return super().map_openai_params(non_default_params, optional_params, model, drop_params)
+        mapped_params: Final = super().map_openai_params(non_default_params, optional_params, model, drop_params)
+        if thinking_disabled:
+            mapped_params[_THINKING_DISABLED_MARKER] = True
+        return mapped_params
+
+    def transform_request(
+        self,
+        model: str,
+        messages: list[  # mutable-ok: framework contract requires mutable request or response containers
+            AllMessageValues
+        ],  # mutable-ok: framework contract requires mutable request or response containers
+        optional_params: dict[str, object],  # mutable-ok: provider request contract
+        litellm_params: dict[str, object],  # mutable-ok: provider request contract
+        headers: dict[str, str],  # mutable-ok: framework contract requires mutable request or response containers
+    ) -> dict[str, object]:  # mutable-ok: framework contract requires mutable request or response containers
+        thinking_disabled: Final = optional_params.pop(_THINKING_DISABLED_MARKER, False) is True
+        request_optional_params: Final = (
+            {  # mutable-ok: framework contract requires mutable request or response containers
+                **optional_params,
+                "reasoning_effort": "off",
+            }  # mutable-ok: framework contract requires mutable request or response containers
+            if thinking_disabled
+            else optional_params  # mutable-ok: framework contract requires mutable request or response containers
+        )
+        request_messages: Final = normalize_reasoning_content(
+            messages,
+            forward=litellm_params.get("forward_reasoning_content") is not False,
+            strings_only=True,
+            normalize=should_normalize_reasoning_content(
+                litellm_params.get("reasoning_content_field"), model=model, provider="hosted_vllm"
+            ),
+        )
+        return super().transform_request(model, request_messages, request_optional_params, litellm_params, headers)
+
+    async def async_transform_request(
+        self,
+        model: str,
+        messages: list[AllMessageValues],  # mutable-ok: provider request contract
+        optional_params: dict[str, object],  # mutable-ok: provider request contract
+        litellm_params: dict[str, object],  # mutable-ok: provider request contract
+        headers: dict[str, str],  # mutable-ok: provider request contract
+    ) -> dict[str, object]:  # mutable-ok: provider request contract
+        thinking_disabled: Final = optional_params.pop(_THINKING_DISABLED_MARKER, False) is True
+        request_optional_params: Final = (
+            {  # mutable-ok: framework contract requires mutable request containers
+                **optional_params,
+                "reasoning_effort": "off",
+            }  # mutable-ok: framework contract requires mutable request containers
+            if thinking_disabled
+            else optional_params  # mutable-ok: framework contract requires mutable request containers
+        )
+        request_messages: Final = normalize_reasoning_content(
+            deepcopy(messages),
+            forward=litellm_params.get("forward_reasoning_content") is not False,
+            strings_only=True,
+            normalize=should_normalize_reasoning_content(
+                litellm_params.get("reasoning_content_field"), model=model, provider="hosted_vllm"
+            ),
+        )
+        return await super().async_transform_request(
+            model, request_messages, request_optional_params, litellm_params, headers
+        )
+
+    def finalize_request(
+        self,
+        *,
+        model: str,
+        request_data: dict,  # mutable-ok: framework contract requires mutable request or response containers
+        litellm_params: object,
+    ) -> dict:  # mutable-ok: framework contract requires mutable request or response containers
+        normalized_request: Final = (
+            {  # mutable-ok: HTTP request serialization requires a dict
+                **dict((key, value) for key, value in request_data.items() if key != "merge_system_messages"),
+                "messages": _merge_system_messages(request_data.get("messages")),
+            }
+            if request_data.get("merge_system_messages") is True
+            else request_data
+        )
+        supplied: Final = "reasoning_effort" in request_data
+        normalized_effort: Final = normalize_deepseek_v4_reasoning_effort(
+            model=model,
+            model_group=get_model_group(litellm_params),
+            reasoning_effort=request_data.get("reasoning_effort"),
+            supplied=supplied,
+        )
+        return (
+            {
+                **normalized_request,
+                "reasoning_effort": normalized_effort,
+            }  # mutable-ok: framework contract requires mutable request or response containers
+            if supplied
+            else normalized_request  # mutable-ok: framework contract requires mutable request or response containers
+        )  # mutable-ok: framework contract requires mutable request or response containers
 
     def _get_openai_compatible_provider_info(
         self, api_base: str | None, api_key: str | None
@@ -146,36 +274,6 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
         elif file_data:
             return ChatCompletionVideoObject(type="video_url", video_url=ChatCompletionVideoUrlObject(url=file_data))
         raise ValueError("file_id or file_data is required")
-
-    def transform_request(
-        self,
-        model: str,
-        messages: list[AllMessageValues],  # mutable-ok: provider request contract
-        optional_params: dict[str, object],  # mutable-ok: provider request contract
-        litellm_params: dict[str, object],  # mutable-ok: provider request contract
-        headers: dict[str, str],  # mutable-ok: provider request contract
-    ) -> dict[str, object]:  # mutable-ok: provider request contract
-        request_messages: Final = normalize_reasoning_content(
-            messages,
-            forward=litellm_params.get("forward_reasoning_content") is not False,
-            strings_only=True,
-            normalize=should_normalize_reasoning_content(
-                litellm_params.get("reasoning_content_field"), model=model, provider="hosted_vllm"
-            ),
-        )
-        return super().transform_request(model, request_messages, optional_params, litellm_params, headers)
-
-    async def async_transform_request(
-        self,
-        model: str,
-        messages: list[AllMessageValues],  # mutable-ok: provider request contract
-        optional_params: dict[str, object],  # mutable-ok: provider request contract
-        litellm_params: dict[str, object],  # mutable-ok: provider request contract
-        headers: dict[str, str],  # mutable-ok: provider request contract
-    ) -> dict[str, object]:  # mutable-ok: provider request contract
-        return await super().async_transform_request(
-            model, deepcopy(messages), optional_params, litellm_params, headers
-        )
 
     @overload
     def _transform_messages(

@@ -107,6 +107,8 @@ def get_supported_openai_params(
         return litellm.BedrockMantleChatConfig().get_supported_openai_params(model=model)
     elif custom_llm_provider == "hosted_vllm":
         return litellm.HostedVLLMChatConfig().get_supported_openai_params(model=model)
+    elif custom_llm_provider == "hosted_vllm_codex":
+        return litellm.HostedVLLMCodexChatConfig().get_supported_openai_params(model=model)
     elif custom_llm_provider == "vllm":
         return litellm.VLLMConfig().get_supported_openai_params(model=model)
     elif custom_llm_provider == "deepseek":

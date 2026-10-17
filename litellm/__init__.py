@@ -2088,6 +2088,9 @@ if TYPE_CHECKING:
     from .llms.hosted_vllm.chat.transformation import (
         HostedVLLMChatConfig as HostedVLLMChatConfig,
     )
+    from .llms.hosted_vllm_codex.chat.transformation import (
+        HostedVLLMCodexChatConfig as HostedVLLMCodexChatConfig,
+    )
     from .llms.hosted_vllm.embedding.transformation import (
         HostedVLLMEmbeddingConfig as HostedVLLMEmbeddingConfig,
     )

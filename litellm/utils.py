@@ -4885,8 +4885,13 @@ def get_optional_params(
             model=model,
             drop_params=bool(drop_params),
         )
-    elif custom_llm_provider == "hosted_vllm":
-        optional_params = litellm.HostedVLLMChatConfig().map_openai_params(
+    elif custom_llm_provider in ("hosted_vllm", "hosted_vllm_codex"):
+        hosted_vllm_config: Final = (
+            litellm.HostedVLLMCodexChatConfig()
+            if custom_llm_provider == "hosted_vllm_codex"
+            else litellm.HostedVLLMChatConfig()
+        )
+        optional_params = hosted_vllm_config.map_openai_params(
             non_default_params=non_default_params,
             optional_params=optional_params,
             model=model,
@@ -8532,6 +8537,7 @@ class ProviderConfigManager:
                 False,
             ),
             LlmProviders.HOSTED_VLLM: (lambda: litellm.HostedVLLMChatConfig(), False),
+            LlmProviders.HOSTED_VLLM_CODEX: (lambda: litellm.HostedVLLMCodexChatConfig(), False),
             LlmProviders.LLAMAFILE: (lambda: litellm.LlamafileChatConfig(), False),
             LlmProviders.LM_STUDIO: (lambda: litellm.LMStudioChatConfig(), False),
             LlmProviders.GALADRIEL: (lambda: litellm.GaladrielChatConfig(), False),

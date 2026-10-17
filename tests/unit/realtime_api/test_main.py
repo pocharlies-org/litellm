@@ -207,7 +207,7 @@ async def test_meta_realtime_dispatches_to_base_handler_with_meta_config(monkeyp
 
     captured: dict[str, object] = {}
 
-    def mock_get_llm_provider(model, api_base, api_key):
+    def mock_get_llm_provider(model, api_base, api_key, litellm_params=None):
         return model.removeprefix("meta/"), "meta", None, api_base
 
     async def mock_async_realtime(**kwargs):
@@ -582,7 +582,7 @@ async def _vertex_provider_config_for(monkeypatch, model: str, vertex_location: 
 
     captured: dict[str, object] = {}
 
-    def mock_get_llm_provider(model, api_base, api_key):
+    def mock_get_llm_provider(model, api_base, api_key, litellm_params=None):
         return model.removeprefix("vertex_ai/"), "vertex_ai", None, api_base
 
     async def mock_token_resolver(**kwargs):

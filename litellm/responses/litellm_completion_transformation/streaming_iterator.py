@@ -1,6 +1,6 @@
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Final, cast
 
 import litellm
@@ -8,8 +8,13 @@ from litellm.main import stream_chunk_builder
 from litellm.responses.litellm_completion_transformation.custom_tools import (
     build_tool_call_item_kwargs,
     extract_custom_tool_names,
-    is_custom_tool_call,
     serialize_tool_call_arguments,
+    unwrap_custom_tool_arguments,
+)
+from litellm.responses.litellm_completion_transformation.tool_search import (
+    TOOL_SEARCH_NAME,
+    build_tool_search_call,
+    has_client_tool_search,
 )
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig,
@@ -22,6 +27,8 @@ from litellm.types.llms.openai import (
     ContentPartAddedEvent,
     ContentPartDoneEvent,
     ContentPartDonePartOutputText,
+    CustomToolCallInputDeltaEvent,
+    CustomToolCallInputDoneEvent,
     FunctionCallArgumentsDeltaEvent,
     FunctionCallArgumentsDoneEvent,
     OutputItemAddedEvent,
@@ -29,9 +36,6 @@ from litellm.types.llms.openai import (
     OutputTextAnnotationAddedEvent,
     OutputTextDeltaEvent,
     OutputTextDoneEvent,
-    ReasoningSummaryPartDoneEvent,
-    ReasoningSummaryTextDeltaEvent,
-    ReasoningSummaryTextDoneEvent,
     ResponseCompletedEvent,
     ResponseCreatedEvent,
     ResponseInProgressEvent,
@@ -117,6 +121,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         self.final_text: str = ""
         self._cached_item_id: str | None = None
         self._message_output_index: int = 0
+        self._reasoning_output_index: int = 0  # claimed when the reasoning item announces itself
         self._cached_response_id: str | None = None
         self._buffered_chunk: ModelResponseStream | None = None
         self._upstream_exhausted: bool = False
@@ -141,12 +146,30 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         self._reasoning_item_id: str | None = None
         self._accumulated_reasoning_content_parts: list[str] = []
         self._accumulated_provider_specific_fields: dict[str, object] = {}
-        self._custom_tool_names: set[str] = extract_custom_tool_names(self.responses_api_request.get("tools"))
-        self._namespace_tool_names = LiteLLMCompletionResponsesConfig.namespace_tool_name_map(
-            self.responses_api_request.get("tools")
-        )
+        effective_tools: Final = LiteLLMCompletionResponsesConfig.effective_tools(request_input, responses_api_request)
+        self._custom_tool_names: frozenset[str] = extract_custom_tool_names(effective_tools)
+        self._client_tool_search = has_client_tool_search(effective_tools)
+        self._namespace_tool_names = LiteLLMCompletionResponsesConfig.namespace_tool_name_map(effective_tools)
+
         self._web_search_calls: dict[str, object] = {}  # mutable-ok: latest call by provider id
         self._queued_web_search_call_ids: set[str] = set()  # mutable-ok: emitted call ids
+
+    def _custom_tool_name_set(self) -> frozenset[str]:
+        # A nested custom tool is addressed by its bare short name: providers flatten only
+        # functions, so an alias short name is unambiguous unless a top-level tool owns it.
+        top_level_function_names: Final = frozenset(
+            str(tool.get("name") or "")
+            for tool in (self.responses_api_request or {}).get("tools") or ()
+            if isinstance(tool, Mapping) and tool.get("type") == "function"
+        )
+        aliases: Final = frozenset(
+            short
+            for flat in self._custom_tool_names
+            if "__" in flat
+            and (short := flat.split("__", 1)[1]) not in self._namespace_tool_names
+            and short not in top_level_function_names
+        )
+        return self._custom_tool_names | aliases
 
     def _get_or_assign_tool_output_index(self, call_id: str) -> int:
         existing: Final = self._tool_output_index_by_call_id.get(call_id)
@@ -167,6 +190,15 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             return None
 
     def _responses_namespace_tool_call_fields(self, fn_name: str) -> tuple[str, str | None]:
+        if fn_name in self._custom_tool_name_set():
+            # A nested custom tool keeps its bare name even when a namespaced function
+            # flattens to the same short name; it is not a namespaced function call.
+            # A flattened custom name still restores its short name + namespace.
+            mapped_custom: Final = self._namespace_tool_names.get(fn_name)
+            if mapped_custom:
+                namespace, tool_name = mapped_custom
+                return tool_name, namespace
+            return fn_name, None
         mapped: Final = self._namespace_tool_names.get(fn_name)
         if mapped:
             namespace, tool_name = mapped
@@ -174,9 +206,8 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         return fn_name, None
 
     def _tool_call_item_kwargs(self, call_id: str, fn_name: str, arguments: str, status: str) -> dict[str, str]:
-        item_kwargs: Final = build_tool_call_item_kwargs(call_id, fn_name, arguments, status, self._custom_tool_names)
-        if is_custom_tool_call(fn_name, self._custom_tool_names):
-            return item_kwargs
+        custom_names: Final = self._custom_tool_name_set()
+        item_kwargs: Final = build_tool_call_item_kwargs(call_id, fn_name, arguments, status, custom_names)
         tool_name, tool_namespace = self._responses_namespace_tool_call_fields(fn_name)
         namespace_kwargs: Final = {"namespace": tool_namespace} if tool_namespace else {}
         return {**item_kwargs, "name": tool_name, **namespace_kwargs}
@@ -193,6 +224,11 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             return False
 
         return delta.content or delta.function_call or delta.tool_calls or chunk.choices[0].finish_reason is not None
+
+    def _initial_tool_item(self, call_id: str, fn_name: str) -> BaseLiteLLMOpenAIResponseObject:
+        if self._client_tool_search and fn_name == TOOL_SEARCH_NAME:
+            return BaseLiteLLMOpenAIResponseObject(**build_tool_search_call(call_id, "", "in_progress").model_dump())
+        return BaseLiteLLMOpenAIResponseObject(**self._tool_call_item_kwargs(call_id, fn_name, "", "in_progress"))
 
     def _reserve_web_search_indexes(self, provider_fields: object) -> None:
         if not isinstance(provider_fields, dict):
@@ -266,7 +302,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             if call_id not in self._tool_args_by_call_id:
                 self._tool_args_by_call_id[call_id] = ""
                 self._sequence_number += 1
-                item_kwargs = self._tool_call_item_kwargs(call_id, fn_name, "", "in_progress")
+                item_kwargs = self._initial_tool_item(call_id, fn_name).model_dump()
                 self._tool_item_id_by_call_id[call_id] = item_kwargs["id"]
                 event = OutputItemAddedEvent(
                     type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
@@ -278,6 +314,8 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
 
             if fn_args_delta:
                 self._tool_args_by_call_id[call_id] += fn_args_delta
+                if self._tool_item_id_by_call_id.get(call_id, "").startswith(("ctc", "tsc_")):
+                    continue
 
                 # Split large argument deltas into smaller chunks to match OpenAI's streaming behavior
                 # This is especially important for providers like Bedrock that send complete arguments at once
@@ -342,7 +380,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             if is_new_tool_call:
                 self._tool_args_by_call_id[call_id] = ""
                 self._sequence_number += 1
-                item_kwargs = self._tool_call_item_kwargs(call_id, fn_name, "", "in_progress")
+                item_kwargs = self._initial_tool_item(call_id, fn_name).model_dump()
                 self._tool_item_id_by_call_id[call_id] = item_kwargs["id"]
                 event = OutputItemAddedEvent(
                     type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
@@ -353,11 +391,28 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 self._pending_tool_events.append(event)
 
             final_args = fn_args or self._tool_args_by_call_id.get(call_id, "")
+            if self._client_tool_search and fn_name == TOOL_SEARCH_NAME:
+                self._sequence_number += 1
+                self._pending_tool_events.append(
+                    OutputItemDoneEvent(
+                        type=ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+                        output_index=output_index,
+                        sequence_number=self._sequence_number,
+                        item=BaseLiteLLMOpenAIResponseObject(
+                            **build_tool_search_call(call_id, final_args, "completed").model_dump()
+                        ),
+                    )
+                )
+                continue
+            if fn_name in self._custom_tool_name_set():
+                self._queue_custom_tool_input_events(call_id, output_index, final_args)
 
             # Emit delta events for arguments that weren't streamed yet
             # This handles cases where Bedrock sends the complete tool call at the end
             already_streamed = self._tool_args_by_call_id.get(call_id, "")
-            remaining_args = final_args[len(already_streamed) :] if final_args else ""
+            remaining_args = (
+                final_args[len(already_streamed) :] if final_args and fn_name not in self._custom_tool_names else ""
+            )
 
             if remaining_args:
                 # Split into smaller chunks to match OpenAI's streaming behavior
@@ -382,7 +437,8 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 arguments=final_args,
             )
             done_event.__dict__["sequence_number"] = self._sequence_number
-            self._pending_tool_events.append(done_event)
+            if fn_name not in self._custom_tool_names:
+                self._pending_tool_events.append(done_event)
 
             self._sequence_number += 1
             item_kwargs = self._tool_call_item_kwargs(call_id, fn_name, final_args, "completed")
@@ -394,6 +450,30 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 item=BaseLiteLLMOpenAIResponseObject(**item_kwargs),
             )
             self._pending_tool_events.append(item_done_event)
+
+    def _queue_custom_tool_input_events(self, call_id: str, output_index: int, arguments: str) -> None:
+        raw_input: Final = unwrap_custom_tool_arguments(arguments)
+        item_id: Final = self._tool_item_id_by_call_id.get(call_id, call_id)
+        self._sequence_number += 1
+        self._pending_tool_events.append(
+            CustomToolCallInputDeltaEvent(
+                type=ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DELTA,
+                sequence_number=self._sequence_number,
+                item_id=item_id,
+                output_index=output_index,
+                delta=raw_input,
+            )
+        )
+        self._sequence_number += 1
+        self._pending_tool_events.append(
+            CustomToolCallInputDoneEvent(
+                type=ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DONE,
+                sequence_number=self._sequence_number,
+                item_id=item_id,
+                output_index=output_index,
+                input=raw_input,
+            )
+        )
 
     def _queue_web_search_events(self, call_id: str, web_search_call: object) -> None:
         from openai.types.responses import ResponseFunctionWebSearch
@@ -517,7 +597,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         if "text" in self.responses_api_request:
             response_created_event_data["text"] = self.responses_api_request["text"]
         response_created_event_data["tool_choice"] = (
-            LiteLLMCompletionResponsesConfig._transform_tool_choice_for_responses_api_response(
+            LiteLLMCompletionResponsesConfig.transform_tool_choice_for_responses_api_response(
                 self.responses_api_request.get("tool_choice")
             )
         )
@@ -674,68 +754,38 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             chunk_dict["usage"] = hidden_params["usage"]
         return chunk_dict
 
-    def create_reasoning_summary_text_done_event(
+    def create_reasoning_text_done_event(
         self,
         reasoning_item_id: str,
         reasoning_content: str,
         sequence_number: int,
-    ) -> ReasoningSummaryTextDoneEvent:
-        """
-        Create response.reasoning_summary_text.done event.
-
-        Example:
-        {
-            "type": "response.reasoning_summary_text.done",
-            "item_id": "rs_0c5dae30e53172980069708ba2f59c8197b71ca9820edad07c",
-            "output_index": 0,
-            "sequence_number": 97,
-            "summary_index": 0,
-            "text": "**Clarifying the first humans**\n\nThe  I'm addressing the user's specific interest."
-        }
-        """
-        return ReasoningSummaryTextDoneEvent(
-            type=ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DONE,
-            item_id=reasoning_item_id,
-            output_index=0,
-            sequence_number=sequence_number,
-            summary_index=0,
-            text=reasoning_content,
+    ) -> BaseLiteLLMOpenAIResponseObject:
+        return BaseLiteLLMOpenAIResponseObject.model_validate(
+            {
+                "type": "response.reasoning_text.done",
+                "item_id": reasoning_item_id,
+                "output_index": self._reasoning_output_index,
+                "sequence_number": sequence_number,
+                "content_index": 0,
+                "text": reasoning_content,
+            }
         )
 
-    def create_reasoning_summary_part_done_event(
+    def create_reasoning_part_done_event(
         self,
         reasoning_item_id: str,
         reasoning_content: str,
         sequence_number: int,
-    ) -> ReasoningSummaryPartDoneEvent:
-        """
-        Create response.reasoning_summary_part.done event.
-
-        Example:
-        {
-            "type": "response.reasoning_summary_part.done",
-            "item_id": "rs_0c5dae30e53172980069708ba2f59c8197b71ca9820edad07c",
-            "output_index": 0,
-            "part": {
-                "type": "summary_text",
-                "text": "**Clarifying the first humans**\n\nThe  earlier hominins. It feels important to ensure I'm addressing the user's specific interest."
-            },
-            "sequence_number": 98,
-            "summary_index": 0
-        }
-        """
-        return ReasoningSummaryPartDoneEvent(
-            type=ResponsesAPIStreamEvents.REASONING_SUMMARY_PART_DONE,
-            item_id=reasoning_item_id,
-            output_index=0,
-            sequence_number=sequence_number,
-            summary_index=0,
-            part=BaseLiteLLMOpenAIResponseObject(
-                **{
-                    "type": "summary_text",
-                    "text": reasoning_content,
-                }
-            ),
+    ) -> BaseLiteLLMOpenAIResponseObject:
+        return BaseLiteLLMOpenAIResponseObject.model_validate(
+            {
+                "type": "response.reasoning_part.done",
+                "item_id": reasoning_item_id,
+                "output_index": self._reasoning_output_index,
+                "sequence_number": sequence_number,
+                "content_index": 0,
+                "part": {"type": "reasoning_text", "text": reasoning_content},
+            }
         )
 
     def create_output_text_done_event(self, litellm_complete_object: ModelResponse) -> OutputTextDoneEvent:
@@ -816,40 +866,17 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         reasoning_content: str,
         sequence_number: int,
     ) -> OutputItemDoneEvent:
-        """
-        Create response.output_item.done event for reasoning items.
-
-        Example:
-        {
-            "type": "response.output_item.done",
-            "output_index": 0,
-            "sequence_number": 99,
-            "item": {
-                "id": "rs_0c5dae30e53172980069708ba2f59c8197b71ca9820edad07c",
-                "type": "reasoning",
-                "summary": [
-                    {
-                        "type": "summary_text",
-                        "text": "**Clarifying the first humans**..."
-                    }
-                ]
-            }
-        }
-        """
         return OutputItemDoneEvent(
             type=ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
-            output_index=0,
+            output_index=self._reasoning_output_index,
             sequence_number=sequence_number,
-            item=BaseLiteLLMOpenAIResponseObject(
-                **{
+            item=BaseLiteLLMOpenAIResponseObject.model_validate(
+                {
                     "id": reasoning_item_id,
                     "type": "reasoning",
-                    "summary": [
-                        {
-                            "type": "summary_text",
-                            "text": reasoning_content,
-                        }
-                    ],
+                    "status": "completed",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": reasoning_content}],
                 }
             ),
         )
@@ -898,6 +925,9 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         return False
 
     def common_done_event_logic(self, sync_mode: bool = True) -> BaseLiteLLMOpenAIResponseObject:
+        self._finish_reasoning()
+        if self._pending_response_events:
+            return self._pending_response_events.pop(0)
         if not self.litellm_model_response or isinstance(self.litellm_model_response, TextCompletionResponse):
             self.litellm_model_response = self.create_litellm_model_response()
         if self.litellm_model_response:
@@ -929,49 +959,79 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             else:
                 raise StopAsyncIteration
 
-    def _ensure_output_item_for_chunk(self, chunk: ModelResponseStream) -> None:
-        # Change: Never return a value, just enqueue output item events
-        if self.sent_output_item_added_event:
+    def _finish_reasoning(self) -> None:
+        if not self._reasoning_active or self._reasoning_done_emitted:
             return
+        reasoning_item_id: Final = self._cached_reasoning_item_id
+        if reasoning_item_id is None:
+            return
+        reasoning_content: Final = "".join(self._accumulated_reasoning_content_parts)
+        self._pending_response_events.extend(
+            (
+                self.create_reasoning_text_done_event(reasoning_item_id, reasoning_content, self._sequence_number + 1),
+                self.create_reasoning_part_done_event(reasoning_item_id, reasoning_content, self._sequence_number + 2),
+                self.create_reasoning_output_item_done_event(
+                    reasoning_item_id, reasoning_content, self._sequence_number + 3
+                ),
+            )
+        )
+        self._sequence_number += 3
+        self._reasoning_done_emitted = True
+        self._reasoning_active = False
+
+    def _ensure_output_item_for_chunk(self, chunk: ModelResponseStream) -> None:
         if not chunk.choices:
             return
         delta: Final = chunk.choices[0].delta
-
-        self._sequence_number += 1
-        self.sent_output_item_added_event = True
-
-        # Reasoning-first
-        if (hasattr(delta, "reasoning_content") and delta.reasoning_content) or _delta_has_signed_thinking_block(delta):
-            self._reasoning_active = True
+        reasoning_content: Final = getattr(delta, "reasoning_content", None)
+        if reasoning_content or _delta_has_signed_thinking_block(delta):
             if self._cached_reasoning_item_id is None:
                 self._cached_reasoning_item_id = f"rs_{uuid.uuid4()}"
-            self._reasoning_item_id = self._cached_reasoning_item_id
-
-            event = OutputItemAddedEvent(
-                type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
-                output_index=0,
-                item=BaseLiteLLMOpenAIResponseObject(
-                    **{
-                        "id": self._cached_reasoning_item_id,
-                        "type": "reasoning",
-                        "status": "in_progress",
-                        "summary": None,
-                    }
-                ),
-            )
-            event.__dict__["sequence_number"] = self._sequence_number
-            self._pending_response_events.append(event)
+                self._reasoning_active = True
+                if self.sent_message_item_added_event:
+                    # The message item already owns output_index=0, so the reasoning item
+                    # that arrives later claims the next unclaimed slot instead.
+                    self._reasoning_output_index = self._next_tool_output_index
+                    self._next_tool_output_index += 1
+                else:
+                    self._reasoning_output_index = 0
+                self._sequence_number += 1
+                reasoning_added: Final = OutputItemAddedEvent(
+                    type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
+                    output_index=self._reasoning_output_index,
+                    item=BaseLiteLLMOpenAIResponseObject.model_validate(
+                        {
+                            "id": self._cached_reasoning_item_id,
+                            "type": "reasoning",
+                            "status": "in_progress",
+                            "summary": [],
+                        }
+                    ),
+                )
+                reasoning_added.__dict__["sequence_number"] = self._sequence_number
+                self._pending_response_events.append(reasoning_added)
+                self._sequence_number += 1
+                self._pending_response_events.append(
+                    BaseLiteLLMOpenAIResponseObject.model_validate(
+                        {
+                            "type": "response.reasoning_part.added",
+                            "item_id": self._cached_reasoning_item_id,
+                            "output_index": self._reasoning_output_index,
+                            "content_index": 0,
+                            "sequence_number": self._sequence_number,
+                            "part": {"type": "reasoning_text", "text": ""},
+                        }
+                    )
+                )
+            if reasoning_content:
+                self._accumulated_reasoning_content_parts.append(reasoning_content)
             return
-
-        # Tool-first
-        if hasattr(delta, "tool_calls") and delta.tool_calls:
-            # Tool calls already handled via _queue_tool_call_delta_events
-            # DO NOT create message item
+        if self._is_reasoning_end(chunk):
+            self._finish_reasoning()
+        if self.sent_message_item_added_event or not delta.content:
             return
-
-        # Default: message
+        self.sent_output_item_added_event = True
         self._queue_message_item_added_events()
-        return
 
     async def __anext__(
         self,
@@ -1016,53 +1076,6 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                         self.collected_chat_completion_chunks.append(
                             self._snapshot_chunk_for_stream_chunk_builder(chunk)
                         )
-                        if self._reasoning_active and not self._reasoning_done_emitted:
-                            # Incrementally accumulate reasoning content instead of
-                            # calling stream_chunk_builder on every chunk (O(n²))
-                            delta = chunk.choices[0].delta if chunk.choices else None
-                            if delta and hasattr(delta, "reasoning_content") and delta.reasoning_content:
-                                self._accumulated_reasoning_content_parts.append(delta.reasoning_content)
-                            if self._is_reasoning_end(chunk):
-                                reasoning_content = "".join(self._accumulated_reasoning_content_parts)
-
-                                # Ensure we have a valid reasoning_item_id
-                                self._cached_reasoning_item_id = (
-                                    self._reasoning_item_id or self._cached_reasoning_item_id or f"rs_{uuid.uuid4()}"
-                                )
-                                reasoning_item_id = self._cached_reasoning_item_id
-
-                                # Create text.done event first with its own sequence number
-                                self._sequence_number += 1
-                                text_done_event = self.create_reasoning_summary_text_done_event(
-                                    reasoning_item_id=reasoning_item_id,
-                                    reasoning_content=reasoning_content,
-                                    sequence_number=self._sequence_number,
-                                )
-
-                                # Create part.done event second with its own sequence number
-                                self._sequence_number += 1
-                                part_done_event = self.create_reasoning_summary_part_done_event(
-                                    reasoning_item_id=reasoning_item_id,
-                                    reasoning_content=reasoning_content,
-                                    sequence_number=self._sequence_number,
-                                )
-
-                                self._sequence_number += 1
-                                reasoning_output_item_done_event = self.create_reasoning_output_item_done_event(
-                                    reasoning_item_id=reasoning_item_id,
-                                    reasoning_content=reasoning_content,
-                                    sequence_number=self._sequence_number,
-                                )
-                                self._pending_response_events.extend(
-                                    [
-                                        text_done_event,
-                                        part_done_event,
-                                        reasoning_output_item_done_event,
-                                    ]
-                                )
-                                self._reasoning_done_emitted = True
-                                self._reasoning_active = False
-
                         response_api_chunk = self._transform_chat_completion_chunk_to_response_api_chunk(chunk)
                         if response_api_chunk:
                             self._pending_response_events.append(response_api_chunk)
@@ -1145,7 +1158,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         Transform a chat completion chunk to a response API chunk.
 
         This currently handles emitting the OutputTextDeltaEvent, which is used by other tools using the responses API
-        and the ReasoningSummaryTextDeltaEvent, which is used by the responses API to emit reasoning content.
+        and reasoning text delta events carrying raw provider reasoning.
         It also handles emitting annotation.added events when annotations are detected in the chunk.
         """
         if self._cached_item_id is None:
@@ -1188,11 +1201,16 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             if self._cached_reasoning_item_id is None:
                 self._cached_reasoning_item_id = f"rs_{uuid.uuid4()}"
 
-            return ReasoningSummaryTextDeltaEvent(
-                type=ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DELTA,
-                item_id=self._cached_reasoning_item_id,
-                output_index=0,
-                delta=reasoning_content,
+            self._sequence_number += 1
+            return BaseLiteLLMOpenAIResponseObject.model_validate(
+                {
+                    "type": "response.reasoning_text.delta",
+                    "item_id": self._cached_reasoning_item_id,
+                    "output_index": self._reasoning_output_index,
+                    "content_index": 0,
+                    "sequence_number": self._sequence_number,
+                    "delta": reasoning_content,
+                }
             )
 
         # Priority 2: Handle text deltas

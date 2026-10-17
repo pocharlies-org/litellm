@@ -2,6 +2,7 @@ import base64
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import reduce
+from itertools import chain
 from typing import Any, Final, Optional, TypeVar, Union, cast, get_type_hints, overload
 
 from pydantic import BaseModel
@@ -141,8 +142,11 @@ class ResponsesAPIRequestUtils:
                 for index, position in enumerate(message_positions)
             }
             trailing_items: Final = original_items[message_positions[-1] + 1 :]
-            return [item for merged in merged_input for item in (*prefixes.get(id(merged), ()), shape(merged))] + list(
-                trailing_items
+            return list(
+                chain(
+                    chain.from_iterable((*prefixes.get(id(merged), ()), shape(merged)) for merged in merged_input),
+                    trailing_items,
+                )
             )
 
         verbose_logger.warning(

@@ -128,6 +128,7 @@ class CustomToolCallOutputItem(BaseLiteLLMOpenAIResponseObject):
     call_id: str
     id: str | None = None
     name: str
+    namespace: str | None = None
     input: str
     status: Literal["in_progress", "completed", "incomplete"] | None = None
 

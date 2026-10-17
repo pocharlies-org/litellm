@@ -696,7 +696,7 @@ def _get_openai_compatible_provider_info(
         # codestral is openai compatible, we just need to set this to custom_openai and have the api_base be https://codestral.mistral.ai/v1
         api_base = api_base or get_secret("CODESTRAL_API_BASE") or "https://codestral.mistral.ai/v1"
         dynamic_api_key = api_key or get_secret_str("CODESTRAL_API_KEY")
-    elif custom_llm_provider == "hosted_vllm":
+    elif custom_llm_provider in ("hosted_vllm", "hosted_vllm_codex"):
         # vllm is openai compatible, we just need to set this to custom_openai
         (
             api_base,

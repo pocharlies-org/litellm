@@ -421,6 +421,8 @@ async def test_async_response_api_handler_posts_the_async_transform_hook_result(
         return_value={"model": "gpt-5", "input": "inlined by the async hook", "stream": True}
     )
     config.sign_request.return_value = ({}, None)
+    config.finalize_request.side_effect = lambda **kwargs: kwargs["request_data"]
+    config.transform_extra_body.side_effect = lambda **kwargs: kwargs["extra_body"]
     client = AsyncHTTPHandler()
     client.post = AsyncMock(
         return_value=httpx.Response(
@@ -429,6 +431,10 @@ async def test_async_response_api_handler_posts_the_async_transform_hook_result(
         )
     )
 
+    logging_obj = Mock()
+    logging_obj.dynamic_success_callbacks = []
+    logging_obj.model_call_details = {}
+
     await handler.async_response_api_handler(
         model="gpt-5",
         input="hi",
@@ -436,7 +442,7 @@ async def test_async_response_api_handler_posts_the_async_transform_hook_result(
         response_api_optional_request_params={},
         custom_llm_provider="chatgpt",
         litellm_params=GenericLiteLLMParams(),
-        logging_obj=Mock(),
+        logging_obj=logging_obj,
         client=client,
     )
 

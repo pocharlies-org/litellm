@@ -140,6 +140,132 @@ async def test_hosted_vllm_responses_reasoning_and_parallel_tools_final_wire(
     assert input_items == original
 
 
+class TestClientToolSearch:
+    @staticmethod
+    def descriptor():
+        return {
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Find tools by capability",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        }
+
+    @pytest.mark.parametrize("lifted", [False, True])
+    def test_client_search_is_a_callable_function(self, lifted):
+        descriptor = self.descriptor()
+        request = {"tool_choice": {"type": "tool_search"}, "tools": [] if lifted else [descriptor]}
+        request_input = ([{"type": "additional_tools", "role": "developer", "tools": [descriptor]}] if lifted else []) + [
+            {"role": "user", "content": "Find calendar tools"}
+        ]
+        result = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+            model="qwen3.8-flash-next", input=request_input, responses_api_request=request
+        )
+        assert len(result["tools"]) == 1
+        assert result["tools"][0]["type"] == "function"
+        assert result["tools"][0]["function"]["name"] == "tool_search"
+        assert result["tools"][0]["function"]["description"] == descriptor["description"]
+        assert result["tools"][0]["function"]["parameters"] == descriptor["parameters"]
+        assert result["tool_choice"] == {"type": "function", "function": {"name": "tool_search"}}
+        assert result["messages"] == [{"role": "user", "content": "Find calendar tools"}]
+
+    @pytest.mark.parametrize("execution", [None, "server"])
+    def test_search_does_not_silently_change_execution_owner(self, execution):
+        descriptor = {key: value for key, value in self.descriptor().items() if key != "execution"}
+        tool = descriptor if execution is None else {**descriptor, "execution": execution}
+        with pytest.raises(ValueError, match="client"):
+            LiteLLMCompletionResponsesConfig.transform_responses_api_tools_to_chat_completion_tools([tool])
+
+    @pytest.mark.parametrize("collision_type", ["function", "custom"])
+    def test_search_rejects_ambiguous_function_name(self, collision_type):
+        with pytest.raises(ValueError, match="tool_search"):
+            LiteLLMCompletionResponsesConfig.transform_responses_api_tools_to_chat_completion_tools([
+                self.descriptor(), {"type": collision_type, "name": "tool_search"}
+            ])
+
+    def test_search_response_and_discovered_tools_survive_replay(self):
+        from copy import deepcopy
+
+        arguments = {"query": "calendar create", "limit": 1}
+        request = {"tools": [self.descriptor()]}
+        response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            request_input="Find calendar tools",
+            responses_api_request=request,
+            chat_completion_response=ModelResponse(
+                model="qwen3.8-flash-next",
+                choices=[Choices(finish_reason="tool_calls", message=Message(role="assistant", content="Finding tools", tool_calls=[{
+                    "id": "call_search", "type": "function",
+                    "function": {"name": "tool_search", "arguments": json.dumps(arguments)}
+                }]))],
+            ),
+        )
+        call = next(item for item in response.output if item.type == "tool_search_call").model_dump(exclude_none=True)
+        message = next(item for item in response.output if item.type == "message")
+        assert message.content[0].text == "Finding tools"
+        assert call["type"] == "tool_search_call"
+        assert call["call_id"] == "call_search"
+        assert call["execution"] == "client"
+        assert call["arguments"] == arguments
+        assert call["status"] == "completed"
+        discovered = {"type": "function", "name": "calendar_create", "description": "Create an event",
+                      "parameters": {"type": "object", "properties": {"title": {"type": "string"}}}}
+        output = {"type": "tool_search_output", "call_id": "call_search", "execution": "client",
+                  "status": "completed", "tools": [discovered]}
+        history = [{"role": "user", "content": "Find calendar tools"}, call, output,
+                   {"type": "additional_tools", "role": "developer", "tools": [discovered]}]
+        original = deepcopy(history)
+        replay = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+            model="qwen3.8-flash-next", input=history, responses_api_request=request
+        )
+        assert history == original
+        assert [tool["function"]["name"] for tool in replay["tools"]].count("calendar_create") == 1
+        assistant = next(message for message in replay["messages"] if message["role"] == "assistant")
+        echoed_call = assistant["tool_calls"][0]
+        assert echoed_call["id"] == "call_search"
+        assert echoed_call["function"]["name"] == "tool_search"
+        assert json.loads(echoed_call["function"]["arguments"]) == arguments
+        result = next(message for message in replay["messages"] if message["role"] == "tool")
+        assert result["tool_call_id"] == "call_search"
+        assert json.loads(result["content"]) == {"tools": [discovered], "status": "completed", "execution": "client"}
+
+    def test_discovered_namespace_keeps_siblings_and_current_schema(self):
+        from copy import deepcopy
+
+        old_lookup = {"type": "function", "name": "lookup", "description": "Legacy lookup",
+                      "parameters": {"type": "object", "properties": {"legacy_id": {"type": "integer"}}}}
+        current_lookup = {"type": "function", "name": "lookup", "description": "Current lookup",
+                          "parameters": {"type": "object", "properties": {"query": {"type": "string"}},
+                                         "required": ["query"]}}
+        historical_sibling = {"type": "function", "name": "list_events",
+                              "parameters": {"type": "object", "properties": {}}}
+        current_sibling = {"type": "function", "name": "create_event",
+                           "parameters": {"type": "object", "properties": {"title": {"type": "string"}}}}
+        history = [
+            {"type": "tool_search_call", "call_id": "call_search", "execution": "client",
+             "arguments": {"query": "calendar"}},
+            {"type": "tool_search_output", "call_id": "call_search", "execution": "client", "status": "completed",
+             "tools": [{"type": "namespace", "name": "calendar", "tools": [old_lookup, historical_sibling]}]},
+        ]
+        request = {"tools": [self.descriptor(),
+                             {"type": "namespace", "name": "calendar", "tools": [current_lookup, current_sibling]}]}
+        original = deepcopy((history, request))
+        result = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+            model="qwen3.8-flash-next", input=history, responses_api_request=request
+        )
+        functions = {tool["function"]["name"]: tool["function"] for tool in result["tools"]}
+        assert len(result["tools"]) == len(functions) == 4
+        assert set(functions) == {"tool_search", "calendar__lookup", "calendar__list_events", "calendar__create_event"}
+        assert functions["calendar__lookup"]["parameters"] == current_lookup["parameters"]
+        assert functions["calendar__lookup"]["description"] == "Current lookup"
+        assert functions["calendar__list_events"]["parameters"] == historical_sibling["parameters"]
+        assert functions["calendar__create_event"]["parameters"] == current_sibling["parameters"]
+        assert (history, request) == original
+
+
 class TestLiteLLMCompletionResponsesConfig:
     def test_transform_input_file_item_to_file_item_with_file_id(self):
         """Test transformation of input_file item with file_id to Chat Completion file format"""
@@ -451,9 +577,9 @@ class TestLiteLLMCompletionResponsesConfig:
                 "rs_"
             ), f"Expected ID to start with 'rs_', got: {reasoning_item.id}"
         assert reasoning_item.status == "completed"
-        assert reasoning_item.role == "assistant"
+        assert reasoning_item.summary == []
         assert len(reasoning_item.content) == 1
-        assert reasoning_item.content[0].type == "output_text"
+        assert reasoning_item.content[0].type == "reasoning_text"
         assert "step by step" in reasoning_item.content[0].text
         assert "42" in reasoning_item.content[0].text
 
@@ -1612,7 +1738,7 @@ class TestToolChoiceTransformation:
     def test_transform_tool_choice_for_responses_api_response(
         self, request_tool_choice: object, expected: str | dict[str, str]
     ) -> None:
-        result: Final = LiteLLMCompletionResponsesConfig._transform_tool_choice_for_responses_api_response(
+        result: Final = LiteLLMCompletionResponsesConfig.transform_tool_choice_for_responses_api_response(
             request_tool_choice
         )
         assert result == expected
@@ -2544,9 +2670,7 @@ class TestToolTransformation:
 
         assert messages[0]["tool_calls"][0]["function"]["name"] == "mcp__everything__get_sum"
 
-    def test_custom_tool_call_echo_keeps_short_name(self):
-        """Custom tools stay advertised under their short name, so a namespace on
-        a custom_tool_call echo is routing metadata and must not be prefixed."""
+    def test_custom_tool_call_echo_restores_qualified_name(self):
         messages = LiteLLMCompletionResponsesConfig._transform_responses_api_function_call_to_chat_completion_message(
             function_call={
                 "type": "custom_tool_call",
@@ -2557,7 +2681,7 @@ class TestToolTransformation:
             }
         )
 
-        assert messages[0]["tool_calls"][0]["function"]["name"] == "apply_patch"
+        assert messages[0]["tool_calls"][0]["function"]["name"] == "mcp__everything__apply_patch"
 
     @pytest.mark.parametrize("nested", [True, False])
     def test_transform_namespace_tools_preserves_allowed_callers(self, nested):
@@ -4005,34 +4129,18 @@ class TestEnsureOutputItemContentPartAdded:
 
     def _make_iterator(self):
         """Create a minimal LiteLLMCompletionStreamingIterator for testing."""
+        from unittest.mock import MagicMock
+
         from litellm.responses.litellm_completion_transformation.streaming_iterator import (
             LiteLLMCompletionStreamingIterator,
         )
 
-        iterator = LiteLLMCompletionStreamingIterator.__new__(
-            LiteLLMCompletionStreamingIterator
+        return LiteLLMCompletionStreamingIterator(
+            model="test-model",
+            litellm_custom_stream_wrapper=MagicMock(),
+            request_input="test",
+            responses_api_request={},
         )
-        iterator.sent_output_item_added_event = False
-        iterator.sent_content_part_added_event = False
-        iterator._sequence_number = 0
-        iterator._cached_item_id = None
-        iterator._cached_reasoning_item_id = None
-        iterator._reasoning_active = False
-        iterator._pending_response_events = []
-        iterator._pending_tool_events = []
-        iterator._tool_output_index_by_call_id = {}
-        iterator._tool_args_by_call_id = {}
-        iterator._tool_item_id_by_call_id = {}
-        iterator._tool_call_id_by_index = {}
-        iterator._ambiguous_tool_call_indexes = set()
-        iterator._next_tool_output_index = 1
-        iterator._final_tool_events_queued = False
-        iterator._custom_tool_names = set()
-        iterator.responses_api_request = {}
-        iterator._namespace_tool_names = LiteLLMCompletionResponsesConfig.namespace_tool_name_map(None)
-        iterator._web_search_calls = {}
-        iterator._queued_web_search_call_ids = set()
-        return iterator
 
     def _make_text_chunk(self):
         """Create a mock ModelResponseStream with a text delta."""
@@ -4539,8 +4647,7 @@ class TestEnsureOutputItemContentPartAdded:
         assert completed_event.response.status == "incomplete"
         assert completed_event.response.output[0].status == "incomplete"
 
-    def test_reasoning_item_does_not_emit_content_part_added(self):
-        """Reasoning items should not get a content_part.added event."""
+    def test_reasoning_item_opens_raw_content_part(self):
         from litellm.types.llms.openai import OutputItemAddedEvent
 
         iterator = self._make_iterator()
@@ -4549,9 +4656,26 @@ class TestEnsureOutputItemContentPartAdded:
         iterator._ensure_output_item_for_chunk(chunk)
 
         events = iterator._pending_response_events
-        assert len(events) == 1
+        assert len(events) == 2
+        assert events[1].type == "response.reasoning_part.added"
+        assert events[1].part == {"type": "reasoning_text", "text": ""}
         assert isinstance(events[0], OutputItemAddedEvent)
         assert iterator.sent_content_part_added_event is False
+
+    def test_signed_thinking_reserves_reasoning_index_before_text(self):
+        iterator = self._make_iterator()
+        chunk = self._make_reasoning_chunk()
+        chunk.choices[0].delta.reasoning_content = None
+        chunk.choices[0].delta.thinking_blocks = [
+            {"type": "thinking", "thinking": "", "signature": "signed-thinking"}
+        ]
+
+        iterator._ensure_output_item_for_chunk(chunk)
+        iterator._ensure_output_item_for_chunk(self._make_text_chunk())
+
+        added = [event for event in iterator._pending_response_events if event.type == "response.output_item.added"]
+        assert [event.item.type for event in added] == ["reasoning", "message"]
+        assert [event.output_index for event in added] == [0, 1]
 
     def test_only_emits_once(self):
         """Calling _ensure_output_item_for_chunk twice should not duplicate events."""
@@ -5208,6 +5332,22 @@ class TestStreamingSnapshotItemIds:
         assert reasoning_items[0].id == streamed_event.item_id
 
 
+def test_codex_agent_message_preserves_assistant_role_and_participants():
+    item = {
+        "type": "agent_message",
+        "author": "parent-agent",
+        "recipient": "child-agent",
+        "content": [{"type": "input_text", "text": "Inspect the service status"}],
+    }
+    messages = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
+        input=[item], responses_api_request={}
+    )
+    assert len(messages) == 1
+    assert messages[0]["role"] == "assistant"
+    content = json.dumps(messages[0]["content"])
+    assert "parent-agent" in content
+    assert "child-agent" in content
+    assert "Inspect the service status" in content
 def test_transform_chat_completion_response_incomplete_details():
     from litellm.types.llms.openai import IncompleteDetails
 

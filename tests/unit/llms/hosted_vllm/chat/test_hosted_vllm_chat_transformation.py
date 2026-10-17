@@ -702,3 +702,31 @@ async def test_normalized_hosted_reasoning_only_forwards_strings(history, is_asy
     expected = {"role": "assistant", "content": "answer", **({"reasoning": value} if isinstance(value, str) else {})}
     assert result["messages"] == [expected]
     assert messages == original
+
+
+def test_merge_system_messages_is_opt_in_and_preserves_content():
+    from copy import deepcopy
+
+    messages = [
+        {"role": "system", "content": "Base instructions"},
+        {"role": "developer", "content": [{"type": "text", "text": "Tool policy"}]},
+        {"role": "user", "content": "First turn"},
+        {"role": "system", "content": "Updated instructions"},
+        {"role": "assistant", "content": "Working"},
+    ]
+    original = deepcopy(messages)
+    config = HostedVLLMChatConfig()
+    unchanged = config.finalize_request(
+        model="qwen3.8-flash-next", request_data={"messages": messages}, litellm_params={}
+    )
+    assert unchanged["messages"] == original
+    result = config.finalize_request(
+        model="qwen3.8-flash-next",
+        request_data={"messages": messages, "merge_system_messages": True},
+        litellm_params={},
+    )
+    assert "merge_system_messages" not in result
+    assert [m["role"] for m in result["messages"]] == ["system", "user", "assistant"]
+    assert result["messages"][0]["content"] == "Base instructions\n\nTool policy\n\nUpdated instructions"
+    assert list(result["messages"][1:]) == [original[2], original[4]]
+    assert messages == original

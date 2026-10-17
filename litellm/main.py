@@ -5926,7 +5926,7 @@ def completion(
             response = _complete_cometapi(_dispatch_ctx)
         elif custom_llm_provider == "minimax":
             response = _complete_minimax(_dispatch_ctx)
-        elif custom_llm_provider == "hosted_vllm":
+        elif custom_llm_provider in ("hosted_vllm", "hosted_vllm_codex"):
             response = _complete_hosted_vllm(_dispatch_ctx)
         elif custom_llm_provider == "edenai":
             response = _complete_edenai(_dispatch_ctx)  # rebind-ok: dispatch chain binds response per branch

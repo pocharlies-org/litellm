@@ -16,7 +16,7 @@ logic.
 """
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set
 from types import MappingProxyType
 from typing import Final
 
@@ -39,41 +39,44 @@ def openai_shaped_tool_call_item_id(item_type: str, tool_id: str) -> str:
     return f"{prefix}_{tool_id}"
 
 
-class _ToolNameFields(BaseModel):
-    type: str = ""
-    name: str = ""
-    tools: tuple[object, ...] = ()
+def extract_custom_tool_names(tools: Sequence[object] | None) -> frozenset[str]:
+    """Extract names of tools originally defined as ``type: "custom"``."""
+    if not tools:
+        return frozenset()
+    top_level_names: Final = frozenset(
+        str(tool.get("name") or "")
+        for tool in tools
+        if isinstance(tool, Mapping) and tool.get("type") in ("function", "custom")
+    )
+    namespace_entries: Final = tuple(
+        (str(tool.get("name") or ""), str(nested.get("name") or ""), nested.get("type"))
+        for tool in tools
+        if isinstance(tool, Mapping) and tool.get("type") == "namespace"
+        for children in (tool.get("tools"),)
+        if isinstance(children, Sequence) and not isinstance(children, (str, bytes))
+        for nested in children
+        if isinstance(nested, Mapping) and nested.get("type") in ("function", "custom")
+    )
+    # Match namespace restoration: accept a bare name only when it identifies one tool.
+    unambiguous_custom_names: Final = frozenset(
+        name
+        for _, name, kind in namespace_entries
+        if kind == "custom"
+        and name not in top_level_names
+        and sum(1 for _, candidate, _ in namespace_entries if candidate == name) == 1
+    )
+    return (
+        frozenset(
+            str(tool["name"])
+            for tool in tools
+            if isinstance(tool, Mapping) and tool.get("type") == "custom" and "name" in tool
+        )
+        | frozenset(f"{namespace}__{name}" for namespace, name, kind in namespace_entries if kind == "custom")
+        | unambiguous_custom_names
+    )
 
 
-def _tool_name_fields_of(tool: object) -> _ToolNameFields | None:
-    try:
-        return _ToolNameFields.model_validate(tool)
-    except ValidationError:
-        return None
-
-
-def _custom_tool_name_of(tool: object) -> str | None:
-    parsed: Final = _tool_name_fields_of(tool)
-    if parsed is None or parsed.type != "custom" or not parsed.name:
-        return None
-    return parsed.name
-
-
-def _nested_tools_of(tool: object) -> tuple[object, ...]:
-    parsed: Final = _tool_name_fields_of(tool)
-    if parsed is None or parsed.type != "namespace":
-        return ()
-    return parsed.tools
-
-
-def extract_custom_tool_names(tools: Sequence[object] | None) -> set[str]:
-    """Extract names of ``type: "custom"`` tools, at the top level or one level inside a ``namespace`` tool."""
-    top_level: Final = tuple(tools or ())
-    nested: Final = tuple(nested_tool for tool in top_level for nested_tool in _nested_tools_of(tool))
-    return {name for tool in (*top_level, *nested) if (name := _custom_tool_name_of(tool)) is not None}
-
-
-def is_custom_tool_call(tool_name: str, custom_tool_names: set[str]) -> bool:
+def is_custom_tool_call(tool_name: str, custom_tool_names: Set[str]) -> bool:
     """Check if a tool call name corresponds to a custom tool."""
     return tool_name in custom_tool_names
 
@@ -120,7 +123,7 @@ def build_tool_call_item_kwargs(
     name: str,
     arguments_or_input: str,
     status: str,
-    custom_tool_names: set[str],
+    custom_tool_names: Set[str],
 ) -> dict[str, str]:
     """Build kwargs for an output item dict that is either a ``function_call``
     or a ``custom_tool_call`` depending on whether *name* is in

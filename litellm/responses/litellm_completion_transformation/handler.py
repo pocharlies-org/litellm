@@ -7,6 +7,12 @@ from typing import Final
 
 import litellm
 from litellm.responses.additional_tools import hoist_additional_tools
+from litellm.responses.litellm_completion_transformation.hosted_vllm_codex_summary import (
+    HostedVLLMCodexSummaryStream,
+    run_summary_sync,
+    summarize_response,
+    summary_requested,
+)
 from litellm.responses.litellm_completion_transformation.streaming_iterator import (
     LiteLLMCompletionStreamingIterator,
 )
@@ -81,10 +87,12 @@ class LiteLLMCompletionTransformationHandler:
                 )
             )
 
+            if summary_requested(custom_llm_provider, responses_api_request):
+                return run_summary_sync(summarize_response(responses_api_response, completion_args))
             return responses_api_response
 
         elif isinstance(litellm_completion_response, litellm.CustomStreamWrapper):
-            return LiteLLMCompletionStreamingIterator(
+            iterator: Final = LiteLLMCompletionStreamingIterator(
                 model=model,
                 litellm_custom_stream_wrapper=litellm_completion_response,
                 request_input=bridged_input,
@@ -92,6 +100,9 @@ class LiteLLMCompletionTransformationHandler:
                 custom_llm_provider=custom_llm_provider,
                 litellm_metadata=kwargs.get("litellm_metadata", {}),
             )
+            if summary_requested(custom_llm_provider, responses_api_request):
+                return HostedVLLMCodexSummaryStream(iterator, completion_args, sync=True)
+            return iterator
         raise ValueError(f"Unexpected response type: {type(litellm_completion_response)}")
 
     async def async_response_api_handler(
@@ -126,10 +137,12 @@ class LiteLLMCompletionTransformationHandler:
                 )
             )
 
+            if summary_requested(litellm_completion_request.get("custom_llm_provider"), responses_api_request):
+                return await summarize_response(responses_api_response, acompletion_args)
             return responses_api_response
 
         elif isinstance(litellm_completion_response, litellm.CustomStreamWrapper):
-            return LiteLLMCompletionStreamingIterator(
+            iterator: Final = LiteLLMCompletionStreamingIterator(
                 model=litellm_completion_request.get("model") or "",
                 litellm_custom_stream_wrapper=litellm_completion_response,
                 request_input=request_input,
@@ -137,4 +150,7 @@ class LiteLLMCompletionTransformationHandler:
                 custom_llm_provider=litellm_completion_request.get("custom_llm_provider"),
                 litellm_metadata=kwargs.get("litellm_metadata", {}),
             )
+            if summary_requested(litellm_completion_request.get("custom_llm_provider"), responses_api_request):
+                return HostedVLLMCodexSummaryStream(iterator, acompletion_args)
+            return iterator
         raise ValueError(f"Unexpected response type: {type(litellm_completion_response)}")
