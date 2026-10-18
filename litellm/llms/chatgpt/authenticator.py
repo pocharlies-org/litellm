@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import sys
 import time
 from collections.abc import Mapping
 from typing import Final, TypeAlias
@@ -31,9 +32,25 @@ DEVICE_CODE_POLL_SLEEP_SECONDS: Final = 5
 
 OPENAI_AUTH_CLAIM_KEY: Final = "https://api.openai.com/auth"
 
+# CHATGPT_DEVICE_LOGIN: auto (interactive only with a TTY) | never | always. A server must never
+# block a request, or the Router's startup, waiting 15 min for a human to approve a device code.
+DEVICE_LOGIN_DISABLED_MESSAGE: Final = (
+    "ChatGPT OAuth: token missing or not renewable and device login disabled; "
+    "renew it with the chatgpt-token-keeper or a new login"
+)
+
 JsonObject: TypeAlias = Mapping[str, JsonValue]
 
 _JSON_OBJECT_ADAPTER: Final = TypeAdapter(JsonObject)
+
+
+def _device_login_allowed() -> bool:
+    mode: Final = (os.getenv("CHATGPT_DEVICE_LOGIN") or "auto").strip().lower()
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return sys.stdin is not None and sys.stdin.isatty()
 
 
 def _optional_str(value: JsonValue | None) -> str | None:
@@ -66,6 +83,9 @@ class Authenticator:
                     return refreshed["access_token"]
                 except RefreshAccessTokenError as exc:
                     verbose_logger.warning("ChatGPT refresh token failed, re-login required: %s", exc)
+
+        if not _device_login_allowed():
+            raise GetAccessTokenError(status_code=401, message=DEVICE_LOGIN_DISABLED_MESSAGE)
 
         cooldown_remaining: Final = self._get_device_code_cooldown_remaining(auth_data)
         if cooldown_remaining > 0:

@@ -68,3 +68,44 @@ class TestChatGPTAuthenticator:
             assert account_id == "acct-123"
             mock_write.assert_called_once()
             assert mock_write.call_args[0][0]["account_id"] == "acct-123"
+
+
+class TestDeviceLoginMode:
+    """CHATGPT_DEVICE_LOGIN: a server never blocks waiting for a human (DGX-1053)."""
+
+    @pytest.fixture
+    def authenticator(self):
+        with patch("os.path.exists", return_value=True):
+            return Authenticator()
+
+    def _no_token(self):
+        return patch("builtins.open", side_effect=OSError("missing"))
+
+    def test_never_raises_instead_of_device_login(self, authenticator, monkeypatch):
+        from litellm.llms.chatgpt.common_utils import GetAccessTokenError
+
+        monkeypatch.setenv("CHATGPT_DEVICE_LOGIN", "never")
+        with self._no_token(), patch.object(authenticator, "_login_device_code") as login:
+            with pytest.raises(GetAccessTokenError, match="device login disabled"):
+                authenticator.get_access_token()
+        login.assert_not_called()
+
+    def test_auto_without_tty_behaves_as_never(self, authenticator, monkeypatch):
+        from litellm.llms.chatgpt.common_utils import GetAccessTokenError
+
+        monkeypatch.delenv("CHATGPT_DEVICE_LOGIN", raising=False)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+        with self._no_token(), patch.object(authenticator, "_login_device_code") as login:
+            with pytest.raises(GetAccessTokenError):
+                authenticator.get_access_token()
+        login.assert_not_called()
+
+    def test_auto_with_tty_and_always_keep_device_login(self, authenticator, monkeypatch):
+        for mode, tty in (("auto", True), ("always", False)):
+            monkeypatch.setenv("CHATGPT_DEVICE_LOGIN", mode)
+            monkeypatch.setattr("sys.stdin.isatty", lambda tty=tty: tty, raising=False)
+            with self._no_token(), patch.object(
+                authenticator, "_login_device_code", return_value={"access_token": "t"}
+            ) as login, patch.object(authenticator, "_get_device_code_cooldown_remaining", return_value=0):
+                assert authenticator.get_access_token() == "t"
+            login.assert_called_once()
