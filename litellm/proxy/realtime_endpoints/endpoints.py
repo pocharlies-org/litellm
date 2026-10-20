@@ -17,6 +17,7 @@ from litellm.proxy.common_utils.encrypt_decrypt_utils import (
     encrypt_value_helper,
 )
 from litellm.proxy.common_utils.http_parsing_utils import (  # noqa: F401  # legacy module exports
+    _normalize_media_type,  # pyright: ignore[reportPrivateUsage]  # reuse the shared HTTP media-type normalization contract
     _read_request_body,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     read_request_body,
 )
@@ -362,6 +363,15 @@ async def create_realtime_client_secret(
     return RealtimeClientSecretResponse(**upstream_json)
 
 
+@router.post("/v1/live", tags=["realtime"])  # mutable-ok: FastAPI route metadata uses a mutable tag list
+@router.post("/live", tags=["realtime"])  # mutable-ok: FastAPI route metadata uses a mutable tag list
+@router.post("/openai/v1/live", tags=["realtime"])  # mutable-ok: FastAPI route metadata uses a mutable tag list
+async def proxy_live_calls(request: Request) -> Response:
+    from litellm.proxy.realtime_endpoints.call_sessions import create_codex_realtime_call
+
+    return await create_codex_realtime_call(request)
+
+
 @router.post(
     "/v1/realtime/calls",
     tags=["realtime"],
@@ -378,6 +388,11 @@ async def proxy_realtime_calls(
     request: Request,
     fastapi_response: Response,
 ) -> Response:
+    if _normalize_media_type(request.headers.get("content-type", "")) in ("application/json", "multipart/form-data"):
+        from litellm.proxy.realtime_endpoints.call_sessions import create_codex_realtime_call
+
+        return await create_codex_realtime_call(request)
+
     from litellm.proxy.proxy_server import (
         add_litellm_data_to_request,
         general_settings,
@@ -413,6 +428,12 @@ async def proxy_realtime_calls(
 
     sdp_body: Final[bytes] = await request.body()
     decoded_payload: Final = _decode_realtime_token_payload(decrypted_token_value)
+    if decoded_payload is None and decrypted_token_value.lstrip().startswith(("{", "[")):
+        return Response(
+            content='{"error":"Invalid or expired token"}',
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            media_type="application/json",
+        )
     if decoded_payload is not None:
         # Check token expiry
         expires_at: Final = decoded_payload.get("expires_at")
