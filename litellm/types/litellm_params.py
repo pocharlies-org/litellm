@@ -88,6 +88,11 @@ class ProviderConnection:
     configurable_clientside_auth_params: "Sequence[str | ConfigurableClientsideParamsCustomAuth] | None" = None
     use_xai_oauth: bool | None = None
     fireworks_forward_user_id: bool | None = None
+    # ChatGPT OAuth deployment options; read from litellm_params by the ChatGPT
+    # adapters and listed as owned so they are never swept into extra_body.
+    chatgpt_auth_profile: str | None = None
+    chatgpt_token_dir: str | None = None
+    chatgpt_auth_file: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -269,6 +274,8 @@ class PromptOptions:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ResponseOptions:
     merge_reasoning_content_in_choices: bool | None = None
+    forward_reasoning_content: bool | None = None
+    reasoning_content_field: str | None = None
     enable_json_schema_validation: bool | None = None
     complete_response: bool | None = None
     keepalive_seconds: float | None = None
