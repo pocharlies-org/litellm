@@ -303,6 +303,7 @@ LLM_CONFIG_NAMES: Final = (
     "AzureOpenAITextConfig",
     "AzureSpeechAudioTranscriptionConfig",
     "HostedVLLMChatConfig",
+    "HostedVLLMCodexChatConfig",
     "HostedVLLMEmbeddingConfig",
     # Alias for backwards compatibility
     "VolcEngineConfig",  # Alias for VolcEngineChatConfig
@@ -1172,6 +1173,10 @@ _LLM_CONFIGS_IMPORT_MAP: Final = {
     "HostedVLLMChatConfig": (
         ".llms.hosted_vllm.chat.transformation",
         "HostedVLLMChatConfig",
+    ),
+    "HostedVLLMCodexChatConfig": (
+        ".llms.hosted_vllm_codex.chat.transformation",
+        "HostedVLLMCodexChatConfig",
     ),
     "HostedVLLMEmbeddingConfig": (
         ".llms.hosted_vllm.embedding.transformation",

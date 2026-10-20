@@ -33,6 +33,8 @@ AWS_CREDENTIAL_KWARGS_KEYS: Final = frozenset(
 
 PROVIDER_AFFINITY_HEADER_KWARG_KEY: Final = "provider_affinity_header"
 
+REASONING_TRANSPORT_KWARGS_KEYS: Final = frozenset({"forward_reasoning_content", "reasoning_content_field"})
+
 # Pre-define optional kwargs keys as frozenset for O(1) lookups
 # These are extracted from kwargs only if present, avoiding unnecessary .get() calls
 OPTIONAL_KWARGS_KEYS: Final = (
@@ -72,6 +74,7 @@ OPTIONAL_KWARGS_KEYS: Final = (
         }
     )
     | AWS_CREDENTIAL_KWARGS_KEYS
+    | REASONING_TRANSPORT_KWARGS_KEYS
     | ANTHROPIC_WIF_KWARGS_KEYS
     | OPENAI_WIF_KWARGS_KEYS
     | frozenset(CustomPricingLiteLLMParams.model_fields)
