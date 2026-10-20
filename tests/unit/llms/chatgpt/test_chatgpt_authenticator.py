@@ -91,7 +91,10 @@ class TestChatGPTAuthenticator:
         assert timeout.connect == HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS
 
     @pytest.mark.asyncio
-    async def test_get_access_token_refuses_device_code_login_in_event_loop(self, authenticator):
+    async def test_get_access_token_refuses_device_code_login_in_event_loop(self, authenticator, monkeypatch):
+        # La puerta propia de TTY (DGX-1053) se saca de en medio: aquí se prueba el guardia
+        # de upstream (can_block_current_thread), no la nuestra.
+        monkeypatch.setenv("CHATGPT_DEVICE_LOGIN", "always")
         with (
             patch("builtins.open", side_effect=FileNotFoundError),
             patch.object(authenticator, "_login_device_code") as mock_login,
@@ -107,7 +110,10 @@ class TestChatGPTAuthenticator:
         mock_wait.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_get_access_token_refuses_cooldown_wait_in_event_loop(self, authenticator):
+    async def test_get_access_token_refuses_cooldown_wait_in_event_loop(self, authenticator, monkeypatch):
+        # La puerta propia de TTY (DGX-1053) se saca de en medio: aquí se prueba el guardia
+        # de upstream (can_block_current_thread), no la nuestra.
+        monkeypatch.setenv("CHATGPT_DEVICE_LOGIN", "always")
         auth_data = json.dumps({"device_code_requested_at": time.time()})
 
         with (
@@ -124,7 +130,10 @@ class TestChatGPTAuthenticator:
         mock_login.assert_not_called()
         mock_wait.assert_not_called()
 
-    def test_get_access_token_refuses_device_code_login_in_worker_thread(self, authenticator):
+    def test_get_access_token_refuses_device_code_login_in_worker_thread(self, authenticator, monkeypatch):
+        # La puerta propia de TTY (DGX-1053) se saca de en medio: aquí se prueba el guardia
+        # de upstream (can_block_current_thread), no la nuestra.
+        monkeypatch.setenv("CHATGPT_DEVICE_LOGIN", "always")
         with (
             patch("builtins.open", side_effect=FileNotFoundError),
             patch.object(authenticator, "_login_device_code") as mock_login,
@@ -140,7 +149,10 @@ class TestChatGPTAuthenticator:
         mock_login.assert_not_called()
         mock_wait.assert_not_called()
 
-    def test_get_access_token_device_code_login_without_event_loop(self, authenticator):
+    def test_get_access_token_device_code_login_without_event_loop(self, authenticator, monkeypatch):
+        # La puerta propia de TTY (DGX-1053) se saca de en medio: aquí se prueba el guardia
+        # de upstream (can_block_current_thread), no la nuestra.
+        monkeypatch.setenv("CHATGPT_DEVICE_LOGIN", "always")
         with (
             patch("builtins.open", side_effect=FileNotFoundError),
             patch.object(authenticator, "_login_device_code", return_value={"access_token": "tok"}),
