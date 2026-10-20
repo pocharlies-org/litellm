@@ -20,7 +20,7 @@ export default function DecisionModelSelect({
   deployments: AutoRouterDeployment[] | undefined;
 }) {
   const id = React.useId();
-  const { data: modelCostMapData } = useModelCostMap();
+  const { data: modelCostMapData } = useModelCostMap(true, true);
   const decisionCatalog = React.useMemo(() => buildDecisionCatalog(modelCostMapData), [modelCostMapData]);
   const decisionModels = modelInfo.filter(
     (model) =>

@@ -3,12 +3,12 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from litellm.types.decisions import MAX_DECISION_QUESTIONS
-from litellm.types.llms.base import LiteLLMPydanticObjectBase
+from litellm.types.llms.base import LiteLLMBaseModel
 
 from .base import GuardrailConfigModel
 
 
-class DecisionModelCheck(LiteLLMPydanticObjectBase):
+class DecisionModelCheck(LiteLLMBaseModel):
     """One predicate the decision model scores the request or response against."""
 
     name: str = Field(min_length=1)

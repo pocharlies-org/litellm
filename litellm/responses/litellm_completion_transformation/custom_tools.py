@@ -20,8 +20,9 @@ from collections.abc import Mapping, Sequence, Set
 from types import MappingProxyType
 from typing import Final
 
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic import TypeAdapter, ValidationError
 
+from litellm.types.llms.base import LiteLLMBaseModel
 from litellm.types.llms.openai import (
     ChatCompletionToolParam,
     ChatCompletionToolParamFunctionChunk,
@@ -74,6 +75,10 @@ def extract_custom_tool_names(tools: Sequence[object] | None) -> frozenset[str]:
         | frozenset(f"{namespace}__{name}" for namespace, name, kind in namespace_entries if kind == "custom")
         | unambiguous_custom_names
     )
+class _ToolNameFields(LiteLLMBaseModel):
+    type: str = ""
+    name: str = ""
+    tools: tuple[object, ...] = ()
 
 
 def is_custom_tool_call(tool_name: str, custom_tool_names: Set[str]) -> bool:
@@ -154,7 +159,7 @@ def build_tool_call_item_kwargs(
     return kwargs
 
 
-class _CustomToolFormat(BaseModel):
+class _CustomToolFormat(LiteLLMBaseModel):
     syntax: str = ""
     definition: str = ""
 

@@ -140,11 +140,6 @@ LAZY_FEATURES: Final[tuple[LazyFeature, ...]] = (
         path_prefixes=("/model-insights",),
     ),
     LazyFeature(
-        name="roi_calculator",
-        module_path="litellm.proxy.management_endpoints.roi_calculator_endpoints",
-        path_prefixes=("/roi-calculator",),
-    ),
-    LazyFeature(
         name="search_tools",
         module_path="litellm.proxy.search_endpoints.search_tool_management",
         path_prefixes=("/search_tools",),
@@ -171,6 +166,7 @@ LAZY_FEATURES: Final[tuple[LazyFeature, ...]] = (
         name="mcp_discoverable",
         module_path="litellm.proxy._experimental.mcp_server.discoverable_endpoints",
         path_prefixes=(
+            "/oauth/client-metadata.json",
             "/.well-known/oauth-",
             "/.well-known/openid-configuration",
             "/.well-known/jwks.json",
@@ -230,6 +226,8 @@ LAZY_FEATURES: Final[tuple[LazyFeature, ...]] = (
             "/tinyfish/",
             "/transcribe",
             "/typesafe/",
+            "/laya/",
+            "/bespoke/",
             "/openrouter/",
             "/vertex-ai/",
             "/vertex_ai/",
@@ -361,7 +359,7 @@ class LazyFeatureMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         # Short-circuit once every feature has loaded.
         if scope["type"] in ("http", "websocket") and len(self._loaded) < len(self._features):
-            path = scope.get("path", "")
+            path: str = scope.get("path", "")
             # Strip the request's root_path so prefix matching works under a
             # server root path. Without this, requests like /api/v1/policies/...
             # never match the registered prefixes (/policies/...) and lazy
@@ -542,11 +540,11 @@ def _register_all_on_startup(inner: "Lifespan[FastAPI]", features: tuple[LazyFea
     (config pass-through endpoints), so the table is put back in lazy mode's order once it is up."""
 
     @asynccontextmanager
-    async def lifespan(app: "FastAPI") -> AsyncGenerator[None]:
+    async def lifespan(app: "FastAPI") -> AsyncGenerator[Mapping[str, object]]:
         register_all_features(app, features)
-        async with inner(app):
+        async with inner(app) as state:
             _restore_registry_order(app, features)
-            yield
+            yield state if state is not None else {}
 
     return lifespan
 
