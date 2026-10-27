@@ -1,5 +1,4 @@
 import { Providers, providerLogoMap } from "@/components/provider_info_helpers";
-import typesafeLogo from "../../../../../public/assets/logos/typesafe.png";
 import { guardrailLogoMap } from "./guardrail_info_helpers";
 
 export interface GuardrailCardInfo {
@@ -249,7 +248,7 @@ export const DECISION_MODEL_CARDS: GuardrailCardInfo[] = [
     description:
       "TypeSafe's Jev decision model answers your yes/no questions about each request, such as prompt injection or policy checks.",
     category: "decision_model",
-    logo: typesafeLogo.src,
+    logo: providerLogoMap[Providers.TypeSafe] ?? "",
     tags: ["Decision Model", "TypeSafe", "Prompt Injection"],
     providerKey: "DecisionModel",
   },
@@ -537,6 +536,16 @@ export const PARTNER_GUARDRAIL_CARDS: GuardrailCardInfo[] = [
     logo: guardrailLogoMap["Microsoft Agent 365"],
     tags: ["Agentic", "MCP", "Tool Misuse", "Observability"],
     providerKey: "Agent365",
+  },
+  {
+    id: "llm_shield_proxy",
+    name: "LLM Shield Proxy",
+    description:
+      "Self-hosted PII redaction that puts the original values back into the model's response, so the provider never receives personal data while the end user still sees it.",
+    category: "partner",
+    logo: guardrailLogoMap["LLM Shield Proxy"],
+    tags: ["PII", "Data Privacy", "Compliance", "Streaming"],
+    providerKey: "LLM Shield Proxy",
   },
   {
     id: "conduct",

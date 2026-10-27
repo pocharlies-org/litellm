@@ -6,7 +6,17 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import ClassifierCircuitBreakerConfig from "./ClassifierCircuitBreakerConfig";
 import type { ComplexityRouterConfigValue } from "./ComplexityRouterConfig";
-import { defaultJevClassifierConfig } from "./jev_classifier_config";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { defaultJevClassifierConfig, fixedClassifierModels } from "./jev_classifier_config";
+
+const providerDescriptions = {
+  jev: "Uses TypeSafe System One Choice evaluation with your configured tiers",
+  laya: "Uses Laya with your configured tiers. Set LAYA_API_BASE on the gateway to connect your Laya server.",
+  bespoke:
+    "Uses Bespoke Nimble with your configured tiers. Set BESPOKE_API_BASE on the gateway to connect your Nimble server.",
+  databricks:
+    "Uses a Databricks ai_decide serving endpoint with your configured tiers. Set DATABRICKS_API_BASE and DATABRICKS_API_KEY on the gateway, and enter the serving endpoint name as the classifier model.",
+};
 
 export default function JevClassifierConfig({
   value,
@@ -19,6 +29,7 @@ export default function JevClassifierConfig({
 }) {
   const id = useId();
   const config = value.jev_classifier_config ?? defaultJevClassifierConfig();
+  const models = fixedClassifierModels(config.provider);
   const update = (patch: Partial<typeof config>) =>
     onChange({ ...value, jev_classifier_config: { ...config, ...patch } });
 
@@ -26,16 +37,34 @@ export default function JevClassifierConfig({
     <div className={section === "model" ? "space-y-3" : "mt-4 space-y-3"}>
       {section !== "advanced" && !config.deployment_name && (
         <>
-          <p className="text-sm text-muted-foreground">
-            Uses TypeSafe System One Choice evaluation with your configured tiers
-          </p>
+          <p className="text-sm text-muted-foreground">{providerDescriptions[config.provider ?? "jev"]}</p>
           <div className="space-y-2">
             <Label htmlFor={`${id}-model`}>Classifier Model</Label>
-            <Input
-              id={`${id}-model`}
-              value={config.model}
-              onChange={(event) => update({ model: event.target.value })}
-            />
+            {models ? (
+              <Select value={config.model} onValueChange={(model) => model && update({ model })}>
+                <SelectTrigger id={`${id}-model`} className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {models.map((model) => (
+                    <SelectItem key={model} value={model}>
+                      {model}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            ) : (
+              <Input
+                id={`${id}-model`}
+                value={config.model}
+                placeholder={
+                  config.provider === "databricks"
+                    ? "Serving endpoint name, e.g. databricks-openjev-qwen35-4b"
+                    : undefined
+                }
+                onChange={(event) => update({ model: event.target.value })}
+              />
+            )}
           </div>
         </>
       )}

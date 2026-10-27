@@ -1,8 +1,7 @@
 import type { StatusTone } from "@/components/shared/table_cells";
+import { isDecisionMode } from "@/lib/decisionModels";
 
 import { trimDecisionChecks, type DecisionModelCheckDraft } from "./buildDecisionModelParams";
-
-const isDecisionMode = (mode: string | null | undefined): boolean => mode === "evaluation";
 
 export interface DecisionModelGroup {
   model_group: string;

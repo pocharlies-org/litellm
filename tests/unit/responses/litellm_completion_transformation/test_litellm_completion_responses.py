@@ -2,9 +2,7 @@ import json
 from copy import deepcopy
 from typing import Final, Literal
 
-import httpx
 import pytest
-import respx
 from openai.types.responses.response_function_web_search import (
     ActionFind,
     ActionOpenPage,
@@ -14,11 +12,13 @@ from openai.types.responses.response_function_web_search import (
 )
 
 import litellm
+from litellm.litellm_core_utils.hidden_params import HIDDEN_PARAMS_ATTR
 from litellm.litellm_core_utils.prompt_templates.factory import anthropic_messages_pt
 from litellm.responses.litellm_completion_transformation.transformation import (
     TOOL_CALLS_CACHE,
     LiteLLMCompletionResponsesConfig,
 )
+from litellm.types.llms.base import HiddenParams
 from litellm.types.responses.main import build_web_search_call
 from litellm.types.utils import (
     ChatCompletionMessageToolCall,
@@ -30,240 +30,6 @@ from litellm.types.utils import (
     PromptTokensDetailsWrapper,
     Usage,
 )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("async_mode", [False, True], ids=["responses", "aresponses"])
-@pytest.mark.parametrize("forward", [None, False, True], ids=["absent", "false", "true"])
-@pytest.mark.parametrize("sequential", [False, True], ids=["parallel-tools", "sequential-tools"])
-@pytest.mark.parametrize("provider", ["hosted_vllm", "openai"])
-@pytest.mark.parametrize("field", [None, "reasoning"])
-@pytest.mark.parametrize("via_router", [False, True])
-async def test_hosted_vllm_responses_reasoning_and_parallel_tools_final_wire(
-    async_mode: bool,
-    forward: bool | None,
-    sequential: bool,
-    provider: str,
-    field: str | None,
-    via_router: bool,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
-    reasoning: Final = "Inspect both tool results before answering."
-    next_reasoning: Final = "Use the first result to inspect the second."
-    input_items: Final = [
-        {"role": "user", "content": "Compare both records"},
-        {
-            "type": "reasoning",
-            "id": "rs_previous",
-            "summary": [],
-            "content": [{"type": "reasoning_text", "text": reasoning}],
-        },
-        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
-        *(
-            [
-                {"type": "function_call_output", "call_id": "call_1", "output": "first record"},
-                {
-                    "type": "reasoning",
-                    "id": "rs_next",
-                    "summary": [],
-                    "content": [{"type": "reasoning_text", "text": next_reasoning}],
-                },
-            ]
-            if sequential
-            else []
-        ),
-        {"type": "function_call", "call_id": "call_2", "name": "lookup", "arguments": "{}"},
-        *([] if sequential else [{"type": "function_call_output", "call_id": "call_1", "output": "first record"}]),
-        {"type": "function_call_output", "call_id": "call_2", "output": "second record"},
-    ]
-    original: Final = deepcopy(input_items)
-    kwargs: Final = {
-        "model": f"{provider}/reasoning-test",
-        "input": input_items,
-        "api_base": "https://responses-reasoning-test.invalid/v1",
-        "api_key": "test-key",
-        "use_chat_completions_api": True,
-        **({} if forward is None else {"forward_reasoning_content": forward}),
-        **({} if field is None else {"reasoning_content_field": field}),
-    }
-    router: Final = litellm.Router(
-        model_list=[
-            {
-                "model_name": "history-alias",
-                "litellm_params": {key: value for key, value in kwargs.items() if key != "input"},
-            }
-        ],
-        num_retries=0,
-    )
-    client: Final = router if via_router else litellm
-    request: Final = {"model": "history-alias", "input": input_items} if via_router else kwargs
-    forwarded: Final = provider == "openai" or forward is not False
-    output_field: Final = field or "reasoning_content"
-    with respx.mock(assert_all_called=True) as mock:
-        route: Final = mock.post("https://responses-reasoning-test.invalid/v1/chat/completions").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "id": "chatcmpl-bridge-reasoning",
-                    "object": "chat.completion",
-                    "created": 1,
-                    "model": "reasoning-test",
-                    "choices": [
-                        {"index": 0, "message": {"role": "assistant", "content": "Compared"}, "finish_reason": "stop"}
-                    ],
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
-                },
-            )
-        )
-        response: Final = await client.aresponses(**request) if async_mode else client.responses(**request)
-        assert response.output[0].content[0].text == "Compared"
-        assert route.call_count == 1
-        payload: Final = json.loads(route.calls[0].request.content)
-        assert payload["model"] == "reasoning-test"
-        assert "forward_reasoning_content" not in route.calls[0].request.content.decode()
-        assert "use_chat_completions_api" not in payload
-        assert "reasoning_content_field" not in payload
-        messages: Final = payload["messages"]
-        assert [message["role"] for message in messages] == (
-            ["user", "assistant", "tool", "assistant", "tool"] if sequential else ["user", "assistant", "tool", "tool"]
-        )
-        assert [tool["id"] for message in messages for tool in message.get("tool_calls", [])] == ["call_1", "call_2"]
-        results: Final = [message for message in messages if message["role"] == "tool"]
-        assert [message["tool_call_id"] for message in results] == ["call_1", "call_2"]
-        assert [message["content"] for message in results] == ["first record", "second record"]
-        assert messages[1].get(output_field) == (reasoning if forwarded else None)
-        assert route.calls[0].request.content.decode().count(reasoning) == int(forwarded)
-        if sequential:
-            assert messages[3].get(output_field) == (next_reasoning if forwarded else None)
-            assert route.calls[0].request.content.decode().count(next_reasoning) == int(forwarded)
-    assert input_items == original
-
-
-class TestClientToolSearch:
-    @staticmethod
-    def descriptor():
-        return {
-            "type": "tool_search",
-            "execution": "client",
-            "description": "Find tools by capability",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
-                "required": ["query"],
-                "additionalProperties": False,
-            },
-        }
-
-    @pytest.mark.parametrize("lifted", [False, True])
-    def test_client_search_is_a_callable_function(self, lifted):
-        descriptor = self.descriptor()
-        request = {"tool_choice": {"type": "tool_search"}, "tools": [] if lifted else [descriptor]}
-        request_input = ([{"type": "additional_tools", "role": "developer", "tools": [descriptor]}] if lifted else []) + [
-            {"role": "user", "content": "Find calendar tools"}
-        ]
-        result = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
-            model="qwen3.8-flash-next", input=request_input, responses_api_request=request
-        )
-        assert len(result["tools"]) == 1
-        assert result["tools"][0]["type"] == "function"
-        assert result["tools"][0]["function"]["name"] == "tool_search"
-        assert result["tools"][0]["function"]["description"] == descriptor["description"]
-        assert result["tools"][0]["function"]["parameters"] == descriptor["parameters"]
-        assert result["tool_choice"] == {"type": "function", "function": {"name": "tool_search"}}
-        assert result["messages"] == [{"role": "user", "content": "Find calendar tools"}]
-
-    @pytest.mark.parametrize("execution", [None, "server"])
-    def test_search_does_not_silently_change_execution_owner(self, execution):
-        descriptor = {key: value for key, value in self.descriptor().items() if key != "execution"}
-        tool = descriptor if execution is None else {**descriptor, "execution": execution}
-        with pytest.raises(ValueError, match="client"):
-            LiteLLMCompletionResponsesConfig.transform_responses_api_tools_to_chat_completion_tools([tool])
-
-    @pytest.mark.parametrize("collision_type", ["function", "custom"])
-    def test_search_rejects_ambiguous_function_name(self, collision_type):
-        with pytest.raises(ValueError, match="tool_search"):
-            LiteLLMCompletionResponsesConfig.transform_responses_api_tools_to_chat_completion_tools([
-                self.descriptor(), {"type": collision_type, "name": "tool_search"}
-            ])
-
-    def test_search_response_and_discovered_tools_survive_replay(self):
-        from copy import deepcopy
-
-        arguments = {"query": "calendar create", "limit": 1}
-        request = {"tools": [self.descriptor()]}
-        response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
-            request_input="Find calendar tools",
-            responses_api_request=request,
-            chat_completion_response=ModelResponse(
-                model="qwen3.8-flash-next",
-                choices=[Choices(finish_reason="tool_calls", message=Message(role="assistant", content="Finding tools", tool_calls=[{
-                    "id": "call_search", "type": "function",
-                    "function": {"name": "tool_search", "arguments": json.dumps(arguments)}
-                }]))],
-            ),
-        )
-        call = next(item for item in response.output if item.type == "tool_search_call").model_dump(exclude_none=True)
-        message = next(item for item in response.output if item.type == "message")
-        assert message.content[0].text == "Finding tools"
-        assert call["type"] == "tool_search_call"
-        assert call["call_id"] == "call_search"
-        assert call["execution"] == "client"
-        assert call["arguments"] == arguments
-        assert call["status"] == "completed"
-        discovered = {"type": "function", "name": "calendar_create", "description": "Create an event",
-                      "parameters": {"type": "object", "properties": {"title": {"type": "string"}}}}
-        output = {"type": "tool_search_output", "call_id": "call_search", "execution": "client",
-                  "status": "completed", "tools": [discovered]}
-        history = [{"role": "user", "content": "Find calendar tools"}, call, output,
-                   {"type": "additional_tools", "role": "developer", "tools": [discovered]}]
-        original = deepcopy(history)
-        replay = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
-            model="qwen3.8-flash-next", input=history, responses_api_request=request
-        )
-        assert history == original
-        assert [tool["function"]["name"] for tool in replay["tools"]].count("calendar_create") == 1
-        assistant = next(message for message in replay["messages"] if message["role"] == "assistant")
-        echoed_call = assistant["tool_calls"][0]
-        assert echoed_call["id"] == "call_search"
-        assert echoed_call["function"]["name"] == "tool_search"
-        assert json.loads(echoed_call["function"]["arguments"]) == arguments
-        result = next(message for message in replay["messages"] if message["role"] == "tool")
-        assert result["tool_call_id"] == "call_search"
-        assert json.loads(result["content"]) == {"tools": [discovered], "status": "completed", "execution": "client"}
-
-    def test_discovered_namespace_keeps_siblings_and_current_schema(self):
-        from copy import deepcopy
-
-        old_lookup = {"type": "function", "name": "lookup", "description": "Legacy lookup",
-                      "parameters": {"type": "object", "properties": {"legacy_id": {"type": "integer"}}}}
-        current_lookup = {"type": "function", "name": "lookup", "description": "Current lookup",
-                          "parameters": {"type": "object", "properties": {"query": {"type": "string"}},
-                                         "required": ["query"]}}
-        historical_sibling = {"type": "function", "name": "list_events",
-                              "parameters": {"type": "object", "properties": {}}}
-        current_sibling = {"type": "function", "name": "create_event",
-                           "parameters": {"type": "object", "properties": {"title": {"type": "string"}}}}
-        history = [
-            {"type": "tool_search_call", "call_id": "call_search", "execution": "client",
-             "arguments": {"query": "calendar"}},
-            {"type": "tool_search_output", "call_id": "call_search", "execution": "client", "status": "completed",
-             "tools": [{"type": "namespace", "name": "calendar", "tools": [old_lookup, historical_sibling]}]},
-        ]
-        request = {"tools": [self.descriptor(),
-                             {"type": "namespace", "name": "calendar", "tools": [current_lookup, current_sibling]}]}
-        original = deepcopy((history, request))
-        result = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
-            model="qwen3.8-flash-next", input=history, responses_api_request=request
-        )
-        functions = {tool["function"]["name"]: tool["function"] for tool in result["tools"]}
-        assert len(result["tools"]) == len(functions) == 4
-        assert set(functions) == {"tool_search", "calendar__lookup", "calendar__list_events", "calendar__create_event"}
-        assert functions["calendar__lookup"]["parameters"] == current_lookup["parameters"]
-        assert functions["calendar__lookup"]["description"] == "Current lookup"
-        assert functions["calendar__list_events"]["parameters"] == historical_sibling["parameters"]
-        assert functions["calendar__create_event"]["parameters"] == current_sibling["parameters"]
-        assert (history, request) == original
 
 
 class TestLiteLLMCompletionResponsesConfig:
@@ -577,9 +343,9 @@ class TestLiteLLMCompletionResponsesConfig:
                 "rs_"
             ), f"Expected ID to start with 'rs_', got: {reasoning_item.id}"
         assert reasoning_item.status == "completed"
-        assert reasoning_item.summary == []
+        assert reasoning_item.role == "assistant"
         assert len(reasoning_item.content) == 1
-        assert reasoning_item.content[0].type == "reasoning_text"
+        assert reasoning_item.content[0].type == "output_text"
         assert "step by step" in reasoning_item.content[0].text
         assert "42" in reasoning_item.content[0].text
 
@@ -1001,6 +767,43 @@ class TestLiteLLMCompletionResponsesConfig:
             "cache_key": "some-cache-key",
             "custom_llm_provider": "openai",
         }
+
+    @pytest.mark.parametrize(
+        "storage",
+        [
+            HiddenParams(model_id="m1", provider_specific_fields={"k": "v"}),
+            {"model_id": "m1", "provider_specific_fields": {"k": "v"}},
+        ],
+    )
+    def test_transform_chat_completion_response_preserves_hidden_params_storage_identity(
+        self, storage: dict[str, object] | HiddenParams
+    ) -> None:
+        chat_completion_response = ModelResponse(
+            id="test-response-id",
+            created=1234567890,
+            model="test-model",
+            object="chat.completion",
+            choices=[
+                Choices(
+                    finish_reason="stop",
+                    index=0,
+                    message=Message(content="Test response", role="assistant"),
+                )
+            ],
+        )
+        setattr(chat_completion_response, HIDDEN_PARAMS_ATTR, storage)
+
+        responses_api_response = (
+            LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+                request_input="Test",
+                responses_api_request={},
+                chat_completion_response=chat_completion_response,
+            )
+        )
+
+        assert getattr(responses_api_response, HIDDEN_PARAMS_ATTR) is storage
+        assert responses_api_response.hidden_params["model_id"] == "m1"
+        assert responses_api_response.provider_specific_fields == {"k": "v"}
 
     def test_transform_chat_completion_response_handles_missing_hidden_params(self):
         """Test that missing _hidden_params defaults to empty dict"""
@@ -2670,7 +2473,9 @@ class TestToolTransformation:
 
         assert messages[0]["tool_calls"][0]["function"]["name"] == "mcp__everything__get_sum"
 
-    def test_custom_tool_call_echo_restores_qualified_name(self):
+    def test_custom_tool_call_echo_keeps_short_name(self):
+        """Custom tools stay advertised under their short name, so a namespace on
+        a custom_tool_call echo is routing metadata and must not be prefixed."""
         messages = LiteLLMCompletionResponsesConfig._transform_responses_api_function_call_to_chat_completion_message(
             function_call={
                 "type": "custom_tool_call",
@@ -2681,7 +2486,7 @@ class TestToolTransformation:
             }
         )
 
-        assert messages[0]["tool_calls"][0]["function"]["name"] == "mcp__everything__apply_patch"
+        assert messages[0]["tool_calls"][0]["function"]["name"] == "apply_patch"
 
     @pytest.mark.parametrize("nested", [True, False])
     def test_transform_namespace_tools_preserves_allowed_callers(self, nested):
@@ -3200,7 +3005,7 @@ class TestUsageTransformation:
         )
 
         # Execute
-        response_usage = LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+        response_usage = LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
             chat_completion_response=chat_completion_response
         )
 
@@ -3242,7 +3047,7 @@ class TestUsageTransformation:
         )
 
         # Execute
-        response_usage = LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+        response_usage = LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
             chat_completion_response=chat_completion_response
         )
 
@@ -3267,7 +3072,7 @@ class TestUsageTransformation:
             ),
         )
 
-        response_usage = LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+        response_usage = LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
             chat_completion_response=usage
         )
 
@@ -3294,7 +3099,7 @@ class TestUsageTransformation:
             completion_tokens_details=CompletionTokensDetailsWrapper(text_tokens=10),
         )
 
-        response_usage = LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+        response_usage = LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
             chat_completion_response=usage
         )
         details = response_usage.input_tokens_details
@@ -3305,7 +3110,7 @@ class TestUsageTransformation:
 
         from litellm.responses.utils import ResponseAPILoggingUtils
 
-        back = ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(response_usage.model_dump())
+        back = ResponseAPILoggingUtils.transform_response_api_usage_to_chat_usage(response_usage.model_dump())
         assert back.prompt_tokens_details.image_tokens == 150
         assert back.prompt_tokens_details.video_tokens == 50
 
@@ -3338,7 +3143,7 @@ class TestUsageTransformation:
         )
 
         # Execute
-        response_usage = LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+        response_usage = LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
             chat_completion_response=chat_completion_response
         )
 
@@ -3381,7 +3186,7 @@ class TestUsageTransformation:
         )
 
         # Execute
-        response_usage = LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+        response_usage = LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
             chat_completion_response=chat_completion_response
         )
 
@@ -3429,7 +3234,7 @@ class TestUsageTransformation:
         )
 
         # Execute
-        response_usage = LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+        response_usage = LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
             chat_completion_response=chat_completion_response
         )
 
@@ -3463,7 +3268,7 @@ class TestUsageTransformation:
         )
 
         # Execute
-        response_usage = LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+        response_usage = LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
             chat_completion_response=chat_completion_response
         )
 
@@ -3506,7 +3311,7 @@ class TestUsageTransformation:
         )
 
         # Execute
-        response_usage = LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+        response_usage = LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
             chat_completion_response=chat_completion_response
         )
 
@@ -3546,7 +3351,7 @@ class TestUsageTransformation:
             ],
         )
 
-        response_usage = LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+        response_usage = LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
             chat_completion_response=chat_completion_response
         )
 
@@ -3582,7 +3387,7 @@ class TestUsageTransformation:
             ],
         )
 
-        response_usage = LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+        response_usage = LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
             chat_completion_response=chat_completion_response
         )
 
@@ -3615,7 +3420,7 @@ class TestUsageTransformation:
             ],
         )
 
-        response_usage = LiteLLMCompletionResponsesConfig._transform_chat_completion_usage_to_responses_usage(
+        response_usage = LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
             chat_completion_response=chat_completion_response
         )
 
@@ -3789,7 +3594,7 @@ class TestStreamingIDConsistency:
         mock_stream_wrapper = Mock(spec=litellm.CustomStreamWrapper)
         mock_logging_obj = Mock()
         mock_stream_wrapper.logging_obj = mock_logging_obj
-        mock_logging_obj._response_cost_calculator = Mock(return_value=0.001)
+        mock_logging_obj.response_cost_calculator = Mock(return_value=0.001)
 
         # Create the streaming iterator
         iterator = LiteLLMCompletionStreamingIterator(
@@ -3998,7 +3803,7 @@ class TestCompletedResponseLatchedOnStreamEnd:
 
         mock_wrapper = Mock(spec=litellm.CustomStreamWrapper)
         mock_wrapper.logging_obj = Mock()
-        mock_wrapper.logging_obj._response_cost_calculator = Mock(return_value=0.0)
+        mock_wrapper.logging_obj.response_cost_calculator = Mock(return_value=0.0)
         mock_wrapper.__aiter__ = Mock(return_value=mock_wrapper)
         mock_wrapper.__anext__ = Mock(side_effect=StopAsyncIteration)
 
@@ -4129,18 +3934,36 @@ class TestEnsureOutputItemContentPartAdded:
 
     def _make_iterator(self):
         """Create a minimal LiteLLMCompletionStreamingIterator for testing."""
-        from unittest.mock import MagicMock
-
         from litellm.responses.litellm_completion_transformation.streaming_iterator import (
             LiteLLMCompletionStreamingIterator,
         )
 
-        return LiteLLMCompletionStreamingIterator(
-            model="test-model",
-            litellm_custom_stream_wrapper=MagicMock(),
-            request_input="test",
-            responses_api_request={},
+        iterator = LiteLLMCompletionStreamingIterator.__new__(
+            LiteLLMCompletionStreamingIterator
         )
+        iterator.sent_output_item_added_event = False
+        iterator.sent_content_part_added_event = False
+        iterator._sequence_number = 0
+        iterator._cached_item_id = None
+        iterator._cached_reasoning_item_id = None
+        iterator._reasoning_active = False
+        iterator._pending_response_events = []
+        iterator._pending_tool_events = []
+        iterator._tool_output_index_by_call_id = {}
+        iterator._tool_args_by_call_id = {}
+        iterator._tool_item_id_by_call_id = {}
+        iterator._tool_call_id_by_index = {}
+        iterator._ambiguous_tool_call_indexes = set()
+        iterator._next_output_index = 0
+        iterator._message_output_index = None
+        iterator._reasoning_output_index = None
+        iterator._final_tool_events_queued = False
+        iterator._custom_tool_names = set()
+        iterator.responses_api_request = {}
+        iterator._namespace_tool_names = LiteLLMCompletionResponsesConfig.namespace_tool_name_map(None)
+        iterator._web_search_calls = {}
+        iterator._queued_web_search_call_ids = set()
+        return iterator
 
     def _make_text_chunk(self):
         """Create a mock ModelResponseStream with a text delta."""
@@ -4600,11 +4423,11 @@ class TestEnsureOutputItemContentPartAdded:
         namespace_map.assert_called_once_with(request["tools"])
 
 
-    def test_emit_response_completed_uses_stream_finish_reason(self):
+    def test_emit_terminal_event_uses_stream_finish_reason(self):
         """
-        When the assembled model response carries finish_reason="content_filter"
-        (snapshotted from the underlying stream before any pending events fire),
-        _emit_response_completed_event must produce status="incomplete".
+        The terminal stream event type must track the assembled response
+        status: finish_reason="content_filter" yields response.incomplete,
+        finish_reason="stop" yields response.completed.
         """
         from unittest.mock import Mock
 
@@ -4612,6 +4435,7 @@ class TestEnsureOutputItemContentPartAdded:
         from litellm.responses.litellm_completion_transformation.streaming_iterator import (
             LiteLLMCompletionStreamingIterator,
         )
+        from litellm.types.llms.openai import ResponsesAPIStreamEvents
 
         mock_stream_wrapper = Mock(spec=litellm.CustomStreamWrapper)
         mock_stream_wrapper.logging_obj = Mock()
@@ -4624,30 +4448,35 @@ class TestEnsureOutputItemContentPartAdded:
             custom_llm_provider="anthropic",
         )
 
-        litellm_model_response = ModelResponse(
-            id="chatcmpl-test",
-            created=1234567890,
-            model="anthropic/claude-sonnet-4-6",
-            object="chat.completion",
-            choices=[
-                Choices(
-                    finish_reason="content_filter",
-                    index=0,
-                    message=Message(content="", role="assistant"),
-                )
-            ],
-            usage=Usage(prompt_tokens=10, completion_tokens=1, total_tokens=11),
-        )
+        def _response(finish_reason: str) -> ModelResponse:
+            return ModelResponse(
+                id="chatcmpl-test",
+                created=1234567890,
+                model="anthropic/claude-sonnet-4-6",
+                object="chat.completion",
+                choices=[
+                    Choices(
+                        finish_reason=finish_reason,
+                        index=0,
+                        message=Message(content="Partial answer", role="assistant"),
+                    )
+                ],
+                usage=Usage(prompt_tokens=10, completion_tokens=1, total_tokens=11),
+            )
 
-        completed_event = iterator._emit_response_completed_event(
-            litellm_model_response
-        )
+        incomplete_event = iterator._emit_terminal_response_event(_response("content_filter"))
+        assert incomplete_event is not None
+        assert incomplete_event.type == ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE
+        assert incomplete_event.response.status == "incomplete"
+        assert incomplete_event.response.output[0].status == "incomplete"
 
+        completed_event = iterator._emit_terminal_response_event(_response("stop"))
         assert completed_event is not None
-        assert completed_event.response.status == "incomplete"
-        assert completed_event.response.output[0].status == "incomplete"
+        assert completed_event.type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED
+        assert completed_event.response.status == "completed"
 
-    def test_reasoning_item_opens_raw_content_part(self):
+    def test_reasoning_item_does_not_emit_content_part_added(self):
+        """Reasoning items should not get a content_part.added event."""
         from litellm.types.llms.openai import OutputItemAddedEvent
 
         iterator = self._make_iterator()
@@ -4656,26 +4485,9 @@ class TestEnsureOutputItemContentPartAdded:
         iterator._ensure_output_item_for_chunk(chunk)
 
         events = iterator._pending_response_events
-        assert len(events) == 2
-        assert events[1].type == "response.reasoning_part.added"
-        assert events[1].part == {"type": "reasoning_text", "text": ""}
+        assert len(events) == 1
         assert isinstance(events[0], OutputItemAddedEvent)
         assert iterator.sent_content_part_added_event is False
-
-    def test_signed_thinking_reserves_reasoning_index_before_text(self):
-        iterator = self._make_iterator()
-        chunk = self._make_reasoning_chunk()
-        chunk.choices[0].delta.reasoning_content = None
-        chunk.choices[0].delta.thinking_blocks = [
-            {"type": "thinking", "thinking": "", "signature": "signed-thinking"}
-        ]
-
-        iterator._ensure_output_item_for_chunk(chunk)
-        iterator._ensure_output_item_for_chunk(self._make_text_chunk())
-
-        added = [event for event in iterator._pending_response_events if event.type == "response.output_item.added"]
-        assert [event.item.type for event in added] == ["reasoning", "message"]
-        assert [event.output_index for event in added] == [0, 1]
 
     def test_only_emits_once(self):
         """Calling _ensure_output_item_for_chunk twice should not duplicate events."""
@@ -5250,7 +5062,7 @@ class TestStreamingSnapshotItemIds:
         )
         assert streamed_event is not None
 
-        completed_event = iterator._emit_response_completed_event(
+        completed_event = iterator._emit_terminal_response_event(
             _bridged_chat_completion_response()
         )
 
@@ -5265,7 +5077,7 @@ class TestStreamingSnapshotItemIds:
             self._make_chunk("apple")
         )
 
-        completed_event = iterator._emit_response_completed_event(
+        completed_event = iterator._emit_terminal_response_event(
             _bridged_chat_completion_response()
         )
 
@@ -5322,7 +5134,7 @@ class TestStreamingSnapshotItemIds:
         )
         assert streamed_event is not None
 
-        completed_event = iterator._emit_response_completed_event(
+        completed_event = iterator._emit_terminal_response_event(
             self._reasoning_chat_completion_response()
         )
 
@@ -5332,22 +5144,6 @@ class TestStreamingSnapshotItemIds:
         assert reasoning_items[0].id == streamed_event.item_id
 
 
-def test_codex_agent_message_preserves_assistant_role_and_participants():
-    item = {
-        "type": "agent_message",
-        "author": "parent-agent",
-        "recipient": "child-agent",
-        "content": [{"type": "input_text", "text": "Inspect the service status"}],
-    }
-    messages = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
-        input=[item], responses_api_request={}
-    )
-    assert len(messages) == 1
-    assert messages[0]["role"] == "assistant"
-    content = json.dumps(messages[0]["content"])
-    assert "parent-agent" in content
-    assert "child-agent" in content
-    assert "Inspect the service status" in content
 def test_transform_chat_completion_response_incomplete_details():
     from litellm.types.llms.openai import IncompleteDetails
 
@@ -5407,6 +5203,140 @@ def test_transform_chat_completion_response_incomplete_details():
     )
     assert result_existing.status == "incomplete"
     assert result_existing.incomplete_details == existing_details
+
+
+def test_transform_chat_completion_response_null_finish_reason_is_incomplete():
+    """
+    A choice with no finish signal (e.g. Gemini thinking consuming the whole
+    output budget, or a provider that never sent one) must not report
+    status "completed". Output at the requested cap reads as
+    max_output_tokens; below it, no reason can be claimed.
+    """
+    choice_at_cap = Choices.model_construct(
+        index=0,
+        finish_reason=None,
+        message=Message(content="", role="assistant"),
+    )
+    resp_at_cap = ModelResponse(
+        id="resp-null-cap",
+        choices=[choice_at_cap],
+        model="gemini-2.5-pro",
+        usage=Usage(prompt_tokens=10, completion_tokens=60, total_tokens=70),
+    )
+    result_at_cap = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        request_input="test prompt",
+        responses_api_request={"max_output_tokens": 60},
+        chat_completion_response=resp_at_cap,
+    )
+    assert result_at_cap.status == "incomplete"
+    assert result_at_cap.incomplete_details is not None
+    assert result_at_cap.incomplete_details.reason == "max_output_tokens"
+
+    choice_under_cap = Choices.model_construct(
+        index=0,
+        finish_reason=None,
+        message=Message(content="", role="assistant"),
+    )
+    resp_under_cap = ModelResponse(
+        id="resp-null-under",
+        choices=[choice_under_cap],
+        model="gemini-2.5-pro",
+        usage=Usage(prompt_tokens=10, completion_tokens=30, total_tokens=40),
+    )
+    result_under_cap = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        request_input="test prompt",
+        responses_api_request={"max_output_tokens": 60},
+        chat_completion_response=resp_under_cap,
+    )
+    assert result_under_cap.status == "incomplete"
+    assert result_under_cap.incomplete_details is None
+
+    resp_empty = ModelResponse(id="resp-empty", choices=[], model="gemini-2.5-pro")
+    result_empty = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        request_input="test prompt",
+        responses_api_request={},
+        chat_completion_response=resp_empty,
+    )
+    assert result_empty.status == "incomplete"
+
+
+def test_transform_chat_completion_response_echoes_request_params():
+    """
+    A chat completion response never carries the caller's request fields, so
+    the bridged response echoes them from the request. Before this fix
+    temperature reported 0 and the rest reported None or empty defaults.
+    """
+    resp = ModelResponse(
+        id="resp-echo",
+        choices=[Choices(index=0, finish_reason="stop", message=Message(content="hi", role="assistant"))],
+        model="gpt-4o",
+    )
+    result = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        request_input="test prompt",
+        responses_api_request={
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 128,
+            "instructions": "be terse",
+            "metadata": {"trace": "abc"},
+            "user": "user-123",
+            "truncation": "disabled",
+            "store": True,
+            "parallel_tool_calls": True,
+        },
+        chat_completion_response=resp,
+    )
+    assert result.temperature == 0.7
+    assert result.top_p == 0.9
+    assert result.max_output_tokens == 128
+    assert result.instructions == "be terse"
+    assert result.metadata == {"trace": "abc"}
+    assert result.user == "user-123"
+    assert result.truncation == "disabled"
+    assert result.store is True
+    assert result.parallel_tool_calls is True
+
+    # Fields the request never set fall back to the response defaults.
+    result_unset = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        request_input="test prompt",
+        responses_api_request={},
+        chat_completion_response=resp,
+    )
+    assert result_unset.temperature is None
+    assert result_unset.metadata == {}
+    assert result_unset.parallel_tool_calls is False
+    assert result_unset.tools == []
+    assert result_unset.text == {}
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value", "expected"),
+    [
+        ("user", 123, None),
+        ("instructions", 5, None),
+        ("text", "plain", {}),
+        ("truncation", "bogus", None),
+        ("parallel_tool_calls", "maybe", False),
+    ],
+)
+def test_transform_drops_request_params_the_response_cannot_echo(
+    field: str, invalid_value: object, expected: object
+) -> None:
+    request: Final[dict[str, object]] = {"temperature": 0.7, field: invalid_value}
+    response: Final = ModelResponse(
+        id="resp-invalid-echo",
+        choices=[Choices(index=0, finish_reason="stop", message=Message(content="hi", role="assistant"))],
+        model="gpt-4o",
+    )
+
+    result: Final = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        request_input="test prompt",
+        responses_api_request=request,
+        chat_completion_response=response,
+    )
+
+    assert getattr(result, field) == expected, f"invalid {field} value {invalid_value!r}"
+    assert result.temperature == 0.7, f"valid temperature was dropped with invalid {field}"
 
 
 @pytest.mark.parametrize("stream", [True, False])

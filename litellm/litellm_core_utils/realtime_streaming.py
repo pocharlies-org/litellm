@@ -172,7 +172,7 @@ class RealTimeStreaming:
         self.tool_calls: list[dict] = []
 
         # Detect whether the client is explicitly opting into the beta protocol.
-        self._client_wants_beta = self._detect_beta_header(websocket)
+        self._client_wants_beta = self.detect_beta_header(websocket)
         self._backend_uses_beta_protocol = (
             self._client_wants_beta if backend_uses_beta_protocol is None else backend_uses_beta_protocol
         )
@@ -200,7 +200,7 @@ class RealTimeStreaming:
         self._pending_guardrail_message: str | None = None
         # Track whether session.created has already been sent to the client
         # (e.g. synthetic event in deferred setup mode).
-        self._session_created_sent_to_client: bool = False
+        self.session_created_sent_to_client: bool = False
         # Track whether we have already sent the guardrail turn-detection update
         # that disables provider auto-response for transcription guardrails.
         self._guardrail_turn_detection_update_sent: bool = False
@@ -220,6 +220,14 @@ class RealTimeStreaming:
         self._is_transcription_session: bool = force_transcription_model is not None
         # Optional per-provider GA event normalizer (e.g. XAIRealtimeNormalizer).
         self._event_normalizer = event_normalizer
+
+    @property
+    def _session_created_sent_to_client(self) -> bool:
+        return self.session_created_sent_to_client
+
+    @_session_created_sent_to_client.setter
+    def _session_created_sent_to_client(self, value: bool) -> None:
+        self.session_created_sent_to_client = value
 
     # Per-connection caps for pre-setup audio frames (message count + total bytes).
     _MAX_BUFFERED_MESSAGES: int = 200
@@ -274,7 +282,7 @@ class RealTimeStreaming:
             # TypedDict union members do not narrow to plain dict for mypy.
             message_obj: dict[str, Any] = cast(dict[str, Any], message)
         else:
-            message_obj = cast(dict[str, Any], json.loads(cast(str, message)))
+            message_obj = cast(dict[str, Any], json.loads(message))
         self._collect_tool_calls_from_response_done(cast(dict, message_obj))
         if message_obj.get("type") in ("session.closed", "session.usage.updated") and isinstance(
             message_obj.get("usage"), dict
@@ -356,10 +364,7 @@ class RealTimeStreaming:
                 tools: Final = session.get("tools")
                 if tools and isinstance(tools, list):
                     self.session_tools = tools
-                # GA: session.type is required; log it for traceability but no action needed
                 verbose_logger.debug("Realtime session.type: %s", session.get("type"))
-                if session.get("type") == "transcription":
-                    self._is_transcription_session = True
         except (json.JSONDecodeError, AttributeError, TypeError):
             pass
 
@@ -520,7 +525,7 @@ class RealTimeStreaming:
                     if self._content_sent_after_setup:
                         verbose_logger.debug("Dropping follow-up setup after content was already sent to backend")
                         continue
-                    msg = self._maybe_inject_guardrail_auto_response_disable(msg)
+                    msg = self.maybe_inject_guardrail_auto_response_disable(msg)
                     await self.backend_ws.send(msg)
                     self._cache_session_configuration_request(msg)
                     sent = True
@@ -787,7 +792,7 @@ class RealTimeStreaming:
         """Disable provider auto-response once when transcription guardrails are enabled."""
         if self._guardrail_turn_detection_update_sent:
             return
-        if not self._has_audio_transcription_guardrails():
+        if not self._should_disable_vad_auto_response():
             return
         sent: Final = await self._send_to_backend(self._make_disable_auto_response_message())
         # Only mark as sent when the provider transformation actually delivered
@@ -797,7 +802,7 @@ class RealTimeStreaming:
         if sent:
             self._guardrail_turn_detection_update_sent = True
 
-    def _maybe_inject_guardrail_auto_response_disable(self, setup_message: str) -> str:
+    def maybe_inject_guardrail_auto_response_disable(self, setup_message: str) -> str:
         """Fold the transcription-guardrail auto-response disable into the setup.
 
         Gemini/Vertex Live reject a second ``setup`` (1007), so the guardrail's
@@ -827,6 +832,8 @@ class RealTimeStreaming:
         )
         return json.dumps(obj)
 
+    _maybe_inject_guardrail_auto_response_disable = maybe_inject_guardrail_auto_response_disable
+
     def _has_realtime_guardrails_for_event_hooks(
         self,
         event_hooks: Sequence["GuardrailEventHooks"],
@@ -838,7 +845,7 @@ class RealTimeStreaming:
             isinstance(cb, CustomGuardrail)
             and any(
                 cb.should_run_guardrail(
-                    data=self.request_data,
+                    data={**self.request_data, "stream": True},
                     event_type=et,
                 )
                 for et in event_hooks
@@ -868,6 +875,10 @@ class RealTimeStreaming:
         from litellm.types.guardrails import GuardrailEventHooks
 
         return self._has_realtime_guardrails_for_event_hooks([GuardrailEventHooks.realtime_input_transcription])
+
+    def _should_disable_vad_auto_response(self) -> bool:
+        """Transcription-only sessions have no assistant turn to gate and reject realtime session updates."""
+        return not self._is_transcription_session and self._has_audio_transcription_guardrails()
 
     async def run_realtime_guardrails(
         self,
@@ -899,7 +910,7 @@ class RealTimeStreaming:
         if event_hooks is None:
             event_hooks = [GuardrailEventHooks.realtime_input_transcription]
         _realtime_event_types: Final = event_hooks
-        _check_data: Final = {**self.request_data, "transcript": transcript}
+        _check_data: Final = {**self.request_data, "transcript": transcript, "stream": True}
         _already_run: Final[set] = set()
 
         for callback in litellm.callbacks:
@@ -948,8 +959,8 @@ class RealTimeStreaming:
                 # clientContent / cancel messages are sent.
                 if pre_block_backend_message is not None:
                     await self._send_to_backend(pre_block_backend_message)
-                # Cancel any in-progress LLM response (e.g. VAD auto-response).
-                await self._send_to_backend(json.dumps({"type": "response.cancel"}))
+                if not self._is_transcription_session:
+                    await self._send_to_backend(json.dumps({"type": "response.cancel"}))
                 # Send the policy violation hint (shows as small gray status text in UI).
                 await self.websocket.send_text(
                     json.dumps(
@@ -963,25 +974,26 @@ class RealTimeStreaming:
                         }
                     )
                 )
-                # Ask the LLM to voice the exact guardrail message so the
-                # user hears it as audio in voice sessions (not just text).
-                guardrail_prompt = (
-                    f"Say exactly the following message to the user, word for word, "
-                    f"do not add anything else: {error_msg}"
-                )
-                await self._send_to_backend(
-                    json.dumps(
-                        {
-                            "type": "conversation.item.create",
-                            "item": {
-                                "type": "message",
-                                "role": "user",
-                                "content": [{"type": "input_text", "text": guardrail_prompt}],
-                            },
-                        }
+                if not self._is_transcription_session:
+                    # Ask the LLM to voice the exact guardrail message so the
+                    # user hears it as audio in voice sessions (not just text).
+                    guardrail_prompt = (
+                        f"Say exactly the following message to the user, word for word, "
+                        f"do not add anything else: {error_msg}"
                     )
-                )
-                await self._send_to_backend(json.dumps({"type": "response.create"}))
+                    await self._send_to_backend(
+                        json.dumps(
+                            {
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": guardrail_prompt}],
+                                },
+                            }
+                        )
+                    )
+                    await self._send_to_backend(json.dumps({"type": "response.create"}))
 
                 self._violation_count += 1
                 end_session_after: int | None = getattr(callback, "end_session_after_n_fails", None)
@@ -1032,6 +1044,8 @@ class RealTimeStreaming:
         for event in events:
             if self._should_drop_event_from_client(event):
                 continue
+            if isinstance(event, dict):
+                self._detect_transcription_session_from_backend(event)
             is_session_created_event = isinstance(event, dict) and event.get("type") == "session.created"
             if is_session_created_event:
                 if self._uses_deferred_backend_setup() and not self._backend_setup_complete:
@@ -1044,7 +1058,7 @@ class RealTimeStreaming:
                                 break
                     finally:
                         self._flushing_pending_messages_until_setup = False
-                if self._session_created_sent_to_client:
+                if self.session_created_sent_to_client:
                     # A synthetic session.created (with placeholder defaults) was
                     # already forwarded to the client when we connected.  The
                     # provider's real session.created (e.g. emitted from Gemini
@@ -1054,7 +1068,7 @@ class RealTimeStreaming:
                     # configuration without seeing two `session.created` events.
                     event = {**event, "type": "session.updated"}
                 else:
-                    self._session_created_sent_to_client = True
+                    self.session_created_sent_to_client = True
             event_str = json.dumps(event)
             ## For audio/VAD guardrail path: forward the (possibly retyped)
             ## session.created first, then invoke the one-time guardrail
@@ -1064,7 +1078,7 @@ class RealTimeStreaming:
             ## after a synthetic session.created from ``llm_http_handler`` in
             ## deferred-setup mode — still get a single chance to inject the
             ## update if a prior attempt was dropped by the provider transform.
-            if is_session_created_event and self._has_audio_transcription_guardrails():
+            if is_session_created_event and self._should_disable_vad_auto_response():
                 self.store_message(event_str)
                 await self._send_event_to_client(event, event_str)
                 await self._maybe_send_guardrail_turn_detection_update()
@@ -1108,7 +1122,7 @@ class RealTimeStreaming:
         # Send session.created to the client FIRST so it stays in sync, then inject
         # the disable-auto-response session.update; otherwise a backend error could
         # reach the client before it sees session.created.
-        if event_type == "session.created" and self._has_audio_transcription_guardrails():
+        if event_type == "session.created" and self._should_disable_vad_auto_response():
             self.store_message(event_obj)
             await self.websocket.send_text(self._event_to_client_json(event_obj))
             await self._send_to_backend(self._make_disable_auto_response_message())
@@ -1120,18 +1134,14 @@ class RealTimeStreaming:
             self.store_message(event_obj)
             await self.websocket.send_text(self._event_to_client_json(event_obj))
 
-            # Transcription-only sessions (e.g. gpt-realtime-whisper) have no
-            # assistant turn: capture audio-duration usage for cost and never
-            # trigger response.create.
             if self._is_transcription_session:
                 self._capture_transcription_usage(event_obj)
-                return True
 
             blocked: Final = await self.run_realtime_guardrails(
                 transcript,
                 item_id=event_obj.get("item_id"),
             )
-            if not blocked:
+            if not blocked and not self._is_transcription_session:
                 await self._send_to_backend(json.dumps({"type": "response.create"}))
             return True
         return False
@@ -1217,7 +1227,7 @@ class RealTimeStreaming:
         self.logging_obj.model_call_details[REALTIME_SESSION_FAILURE_LOGGED_KEY] = True
 
     @staticmethod
-    def _detect_beta_header(websocket: ScopedWebSocket) -> bool:
+    def detect_beta_header(websocket: ScopedWebSocket) -> bool:
         """Return True if the client sent 'OpenAI-Beta: realtime=v1'.
 
         Checks the raw ASGI scope headers so it works for both FastAPI WebSocket
@@ -1235,6 +1245,8 @@ class RealTimeStreaming:
         except Exception:
             pass
         return False
+
+    _detect_beta_header = detect_beta_header
 
     @staticmethod
     def _remap_beta_session_to_ga(session: dict) -> dict:
@@ -1495,7 +1507,7 @@ class RealTimeStreaming:
                         msg_type == "session.update"
                         and self.session_configuration_request is None
                         and not self._guardrail_turn_detection_update_sent
-                        and self._has_audio_transcription_guardrails()
+                        and self._should_disable_vad_auto_response()
                     ):
                         session: Mapping[str, object] | None = msg_obj.setdefault("session", {})
                         if isinstance(session, dict):
@@ -1522,7 +1534,7 @@ class RealTimeStreaming:
                     if (
                         msg_type == "session.update"
                         and not guardrail_turn_detection_injected
-                        and self._has_audio_transcription_guardrails()
+                        and self._should_disable_vad_auto_response()
                     ):
                         session = client_event.get("session")
                         if isinstance(session, dict):
@@ -1659,4 +1671,4 @@ class RealTimeStreaming:
 
 def client_sent_openai_beta_realtime_header(websocket: ScopedWebSocket) -> bool:
     """True when the client WebSocket includes ``OpenAI-Beta: realtime=v1``."""
-    return RealTimeStreaming._detect_beta_header(websocket)
+    return RealTimeStreaming.detect_beta_header(websocket)

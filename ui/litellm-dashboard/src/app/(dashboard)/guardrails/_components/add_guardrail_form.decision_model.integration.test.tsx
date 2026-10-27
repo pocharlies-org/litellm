@@ -87,6 +87,7 @@ describe("AddGuardrailForm decision model questions", () => {
 
     await user.click(await screen.findByLabelText("Decision Model"));
     const jev = await screen.findByTitle("jev-latest");
+    expect(within(jev).getByRole("img", { name: "TypeSafe logo" })).toBeInTheDocument();
     expect(within(screen.getByTitle("gpt-5")).getByRole("img", { name: "OpenAI logo" })).toBeInTheDocument();
     expect(screen.queryByTitle("gpt-4o-mini")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Decision Provider")).not.toBeInTheDocument();
