@@ -7763,3 +7763,340 @@ async def test_a2a_url_target_owns_invocation_fee_and_request_limit(
         await _rpm_request(limiter, cache, auth, "a2a/cheap")
     assert denied.value.status_code == 429
     assert "expensive" in str(denied.value.detail)
+
+
+from litellm.proxy.hooks.parallel_request_limiter_v3 import isolated_request_stash
+from litellm.proxy.hooks.realtime_call_lease import realtime_call_attachment
+
+
+@pytest.mark.asyncio
+async def test_realtime_lease_retains_quota_across_signaling_and_three_attachments():
+    cache = DualCache()
+    handler = _PROXY_MaxParallelRequestsHandler(InternalUsageCache(cache))
+    auth = UserAPIKeyAuth(api_key="logical-owner", max_parallel_requests=1, rpm_limit=4, tpm_limit=100000)
+    data = {"model": "gpt-3.5-turbo", "litellm_call_id": "signaling"}
+    await handler.async_pre_call_hook(auth, cache, data, "arealtime_calls")
+    stash = get_request_stash()
+    assert stash.reserved_tokens > 0
+    assert handler.transfer_realtime_call_slot({"litellm_call_id": "other-call"}) is None
+    assert stash.parallel_slot is not None
+    lease = handler.transfer_realtime_call_slot(data)
+    assert lease is not None
+    assert stash.parallel_slot is None
+    assert stash.reserved_tokens > 0
+    assert not stash.reservation_released
+    assert handler.transfer_realtime_call_slot(data) is None
+    await handler.async_log_success_event(
+        kwargs={
+            "litellm_call_id": "signaling",
+            "standard_logging_object": {"metadata": {"user_api_key_hash": auth.api_key}},
+        },
+        response_obj=ModelResponse(usage=Usage()),
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+    )
+    assert await cache.async_get_cache("{api_key:logical-owner}:tokens") == 0
+    socket = object()
+    for attachment in range(3):
+        with isolated_request_stash(), realtime_call_attachment(socket):
+            attachment_data = {
+                "model": "gpt-3.5-turbo",
+                "litellm_call_id": f"attachment-{attachment}",
+                "websocket": socket,
+            }
+            await handler.async_pre_call_hook(auth, cache, attachment_data, "_arealtime")
+            assert get_request_stash().parallel_slot is None
+            await handler.async_release_realtime_attachment(attachment_data, auth)
+    with isolated_request_stash(), realtime_call_attachment(socket), pytest.raises(HTTPException) as error:
+        await handler.async_pre_call_hook(auth, cache, {"model": "gpt-3.5-turbo", "websocket": socket}, "_arealtime")
+    assert error.value.status_code == 429
+    assert "requests" in str(error.value.detail)
+    quota_only = auth.model_copy(update={"rpm_limit": None})
+    with isolated_request_stash(), realtime_call_attachment(object()), pytest.raises(HTTPException) as error:
+        await handler.async_pre_call_hook(
+            quota_only, cache, {"model": "gpt-3.5-turbo", "websocket": socket}, "_arealtime"
+        )
+    assert "max_parallel_requests" in str(error.value.detail)
+    with isolated_request_stash(), realtime_call_attachment(socket), pytest.raises(HTTPException) as error:
+        await handler.async_pre_call_hook(
+            quota_only, cache, {"model": "gpt-3.5-turbo", "websocket": socket}, "acompletion"
+        )
+    assert "max_parallel_requests" in str(error.value.detail)
+    with isolated_request_stash(), pytest.raises(HTTPException) as error:
+        await handler.async_pre_call_hook(quota_only, cache, {"model": "gpt-3.5-turbo"}, "arealtime_calls")
+    assert "max_parallel_requests" in str(error.value.detail)
+    assert get_request_stash() is stash
+    await lease.close()
+    with isolated_request_stash():
+        await handler.async_pre_call_hook(quota_only, cache, {"model": "gpt-3.5-turbo"}, "arealtime_calls")
+
+
+@pytest.mark.asyncio
+async def test_realtime_lease_renewal_preserves_quota_past_ttl_and_does_not_resurrect_expiry():
+    cache = DualCache()
+    clock = TimeController()
+    handler = _PROXY_MaxParallelRequestsHandler(InternalUsageCache(cache), time_provider=clock.now)
+    auth = UserAPIKeyAuth(api_key="long-call", max_parallel_requests=1)
+    data = {"model": "gpt-3.5-turbo", "litellm_call_id": "long-call"}
+    await handler.async_pre_call_hook(auth, cache, data, "arealtime_calls")
+    lease = handler.transfer_realtime_call_slot(data)
+    assert lease is not None
+    clock.advance(PARALLEL_REQUEST_SLOT_TTL_SECONDS - 1)
+    assert await lease.renew()
+    clock.advance(2)
+    with isolated_request_stash(), pytest.raises(HTTPException):
+        await handler.async_pre_call_hook(auth, cache, {"model": "gpt-3.5-turbo"}, "arealtime_calls")
+
+    clock.advance(PARALLEL_REQUEST_SLOT_TTL_SECONDS)
+    assert not await lease.renew()
+    await asyncio.wait_for(lease.wait_failed(), 1)
+    with isolated_request_stash():
+        await handler.async_pre_call_hook(auth, cache, {"model": "gpt-3.5-turbo"}, "arealtime_calls")
+    await lease.close()
+    with isolated_request_stash(), pytest.raises(HTTPException):
+        await handler.async_pre_call_hook(auth, cache, {"model": "gpt-3.5-turbo"}, "arealtime_calls")
+
+
+
+
+class _ClusterParallelTransport:
+    def __init__(self, handler):
+        self.handler = handler
+        self.members = {}
+        self.now = 10000
+        self.calls = []
+        self.fail = None
+        self.lose_acquire_response = None
+        self.pause_acquire = None
+        self.entered = asyncio.Event()
+
+    def script(self, operation):
+        async def run(*, keys, args):
+            self.calls.append((operation, tuple(keys)))
+            if len({self.handler.keyslot_for_redis_cluster(key) for key in keys}) > 1:
+                raise RuntimeError("CROSSSLOT Keys in request do not hash to the same slot")
+            if self.fail is not None and (operation, keys[0]) == self.fail:
+                raise RuntimeError("Shard unavailable")
+            if operation in ("acquire", "count"):
+                for key in keys:
+                    self.members[key] = {
+                        slot: score
+                        for slot, score in self.members.get(key, {}).items()
+                        if score > self.now - PARALLEL_REQUEST_SLOT_TTL_SECONDS
+                    }
+            if operation == "acquire":
+                for index, key in enumerate(keys):
+                    if len(self.members[key]) >= args[index * 3]:
+                        return [1, index + 1, len(self.members[key])]
+                for index, key in enumerate(keys):
+                    self.members[key][args[index * 3 + 2]] = self.now
+                if keys[0] == self.pause_acquire:
+                    self.entered.set()
+                    await asyncio.Event().wait()
+                if keys[0] == self.lose_acquire_response:
+                    raise RuntimeError("Reply lost after Redis admitted slot")
+                return [0, *(len(self.members[key]) for key in keys)]
+            if operation == "count":
+                return [len(self.members.get(key, {})) for key in keys]
+            if operation == "renew":
+                if any(self.members.get(key, {}).get(args[0], 0) <= self.now - args[1] for key in keys):
+                    return [0]
+                for key in keys:
+                    self.members[key][args[0]] = self.now
+                return [1]
+            assert operation == "release"
+            for index, key in enumerate(keys):
+                self.members.get(key, {}).pop(args[index], None)
+            return [len(self.members.get(key, {})) for key in keys]
+
+        return run
+
+
+def _cluster_parallel_fixture(monkeypatch):
+    handler = _PROXY_MaxParallelRequestsHandler(InternalUsageCache(DualCache()))
+    monkeypatch.setattr(handler, "_is_redis_cluster", lambda: True)
+    transport = _ClusterParallelTransport(handler)
+    for operation in ("acquire", "count", "renew", "release"):
+        monkeypatch.setattr(handler, f"parallel_{operation}_script", transport.script(operation))
+    gauges = [
+        {"counter_key": "{api_key:owner}:max_parallel_requests", "limit": 1, "descriptor_key": "api_key"},
+        {"counter_key": "{team:group}:max_parallel_requests", "limit": 2, "descriptor_key": "team"},
+        {"counter_key": "{api_key:owner}:another-parallel-scope", "limit": 1, "descriptor_key": "extra"},
+    ]
+    return handler, transport, gauges
+
+
+@pytest.mark.asyncio
+async def test_cluster_parallel_slots_admit_count_renew_release_across_hash_slots(monkeypatch):
+    handler, transport, gauges = _cluster_parallel_fixture(monkeypatch)
+    keys = tuple(gauge["counter_key"] for gauge in gauges)
+    transport.members[keys[1]] = {"unrelated": transport.now}
+    result = await handler._check_parallel_request_gauges(gauges, "owner")
+    assert result["overall_code"] == "OK"
+    assert len([call for call in transport.calls if call[0] == "acquire"]) == 2
+    assert all("owner" in transport.members[key] for key in keys)
+    result = await handler._check_parallel_request_gauges(gauges, "reader", read_only=True)
+    assert result["overall_code"] == "OVER_LIMIT"
+    assert [status["descriptor_key"] for status in result["statuses"]] == ["api_key", "team", "extra"]
+    transport.now += PARALLEL_REQUEST_SLOT_TTL_SECONDS - 1
+    assert await handler._renew_realtime_call_slot("owner", keys)
+    transport.now += 2
+    result = await handler._check_parallel_request_gauges(gauges, "second")
+    assert result["overall_code"] == "OVER_LIMIT"
+    acquisition = ParallelSlotAcquisition(slot_id="owner", counter_keys=list(keys))
+    await handler._release_parallel_request_slots(acquisition)
+    await handler._release_parallel_request_slots(acquisition)
+    assert all("owner" not in transport.members[key] for key in keys)
+    assert not await handler._renew_realtime_call_slot("owner", keys)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["limit", "unreachable", "lost_reply", "cancel"])
+async def test_cluster_parallel_acquire_rolls_back_attempted_shards_without_releasing_others(monkeypatch, failure):
+    handler, transport, gauges = _cluster_parallel_fixture(monkeypatch)
+    keys = tuple(gauge["counter_key"] for gauge in gauges)
+    transport.members[keys[1]] = {"unrelated": transport.now}
+    if failure == "limit":
+        gauges[1]["limit"] = 1
+    elif failure == "unreachable":
+        transport.fail = ("acquire", keys[1])
+    elif failure == "lost_reply":
+        transport.lose_acquire_response = keys[1]
+    else:
+        transport.pause_acquire = keys[1]
+    task = asyncio.create_task(handler._check_parallel_request_gauges(gauges, "owner"))
+    if failure == "cancel":
+        await asyncio.wait_for(transport.entered.wait(), timeout=1)
+        task.cancel()
+    if failure == "limit":
+        assert (await task)["overall_code"] == "OVER_LIMIT"
+    else:
+        with pytest.raises(asyncio.CancelledError if failure == "cancel" else RuntimeError):
+            await task
+    assert all("owner" not in transport.members.get(key, {}) for key in keys)
+    assert transport.members[keys[1]] == {"unrelated": transport.now}
+    released_keys = {key for operation, group in transport.calls if operation == "release" for key in group}
+    assert released_keys == set(keys)
+
+
+@pytest.mark.asyncio
+async def test_cluster_parallel_release_continues_after_shard_failure_and_renewal_fails_closed(monkeypatch):
+    handler, transport, gauges = _cluster_parallel_fixture(monkeypatch)
+    keys = tuple(gauge["counter_key"] for gauge in gauges)
+    assert (await handler._check_parallel_request_gauges(gauges, "owner"))["overall_code"] == "OK"
+    transport.fail = ("renew", keys[1])
+    assert not await handler._renew_realtime_call_slot("owner", keys)
+    transport.fail = None
+    transport.members[keys[1]].pop("owner")
+    assert not await handler._renew_realtime_call_slot("owner", keys)
+    assert "owner" not in transport.members[keys[1]]
+    transport.fail = ("count", keys[1])
+    with pytest.raises(RuntimeError, match="Shard unavailable"):
+        await handler._check_parallel_request_gauges(gauges, "reader", read_only=True)
+    transport.fail = ("release", keys[0])
+    receipt = ParallelSlotAcquisition(slot_id="owner", counter_keys=list(keys))
+    with pytest.raises(RuntimeError, match="Shard unavailable"):
+        await handler._release_parallel_request_slots(receipt)
+    assert "owner" not in transport.members[keys[1]]
+    transport.fail = None
+    await handler._release_parallel_request_slots(receipt)
+    assert all("owner" not in transport.members.get(key, {}) for key in keys)
+
+
+@pytest.mark.asyncio
+async def test_cluster_parallel_duplicate_scope_keeps_strictest_limit(monkeypatch):
+    handler, transport, gauges = _cluster_parallel_fixture(monkeypatch)
+    gauges.append({**gauges[0], "limit": 100})
+    transport.members[gauges[0]["counter_key"]] = {"unrelated": transport.now}
+    assert (await handler._check_parallel_request_gauges(gauges, "owner"))["overall_code"] == "OVER_LIMIT"
+    assert transport.members[gauges[0]["counter_key"]] == {"unrelated": transport.now}
+
+
+@pytest.mark.asyncio
+async def test_cluster_rollback_waits_through_repeated_cancellation(monkeypatch):
+    handler, transport, gauges = _cluster_parallel_fixture(monkeypatch)
+    keys = tuple(gauge["counter_key"] for gauge in gauges)
+    transport.lose_acquire_response = keys[1]
+    release_entered, finish_release = asyncio.Event(), asyncio.Event()
+    release = handler.parallel_release_script
+
+    async def blocked_release(*, keys, args):
+        release_entered.set()
+        await finish_release.wait()
+        return await release(keys=keys, args=args)
+
+    monkeypatch.setattr(handler, "parallel_release_script", blocked_release)
+    task = asyncio.create_task(handler._check_parallel_request_gauges(gauges, "owner"))
+    await asyncio.wait_for(release_entered.wait(), timeout=1)
+    try:
+        for _ in range(3):
+            task.cancel()
+            await asyncio.sleep(0)
+        assert not task.done(), "admission returned while its Redis compensation was still running"
+    finally:
+        finish_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+    assert task.cancelled()
+    assert all("owner" not in transport.members.get(key, {}) for key in keys)
+
+
+@pytest.mark.asyncio
+async def test_standalone_realtime_renewal_keeps_single_atomic_batch(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    handler = _PROXY_MaxParallelRequestsHandler(InternalUsageCache(DualCache()))
+    monkeypatch.setattr(handler, "_is_redis_cluster", lambda: False)
+    renew = AsyncMock(return_value=[1])
+    monkeypatch.setattr(handler, "parallel_renew_script", renew)
+    keys = ("{api_key:owner}:max_parallel_requests", "{team:group}:max_parallel_requests")
+    assert await handler._renew_realtime_call_slot("owner", keys)
+    renew.assert_awaited_once_with(keys=keys, args=("owner", PARALLEL_REQUEST_SLOT_TTL_SECONDS))
+
+
+
+
+@pytest.mark.asyncio
+async def test_cluster_gauge_guards_fail_fast_when_scripts_are_unavailable(monkeypatch):
+    # _check_parallel_request_gauges only enters the cluster path with an acquire script in hand, so the
+    # guards below run only for direct cluster callers or script resets racing an in-flight batch.
+    handler, transport, gauges = _cluster_parallel_fixture(monkeypatch)
+    monkeypatch.setattr(handler, "parallel_count_script", None)
+    with pytest.raises(RuntimeError, match="Redis cluster parallel count script is unavailable"):
+        await handler._check_cluster_parallel_gauges(gauges, "reader", None, read_only=True)
+    monkeypatch.setattr(handler, "parallel_count_script", transport.script("count"))
+    monkeypatch.setattr(handler, "parallel_acquire_script", None)
+    with pytest.raises(RuntimeError, match="Redis cluster parallel acquire script is unavailable"):
+        await handler._check_cluster_parallel_gauges(gauges, "owner", None, read_only=False)
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_cluster_release_guards_when_release_script_unavailable(monkeypatch):
+    handler, transport, gauges = _cluster_parallel_fixture(monkeypatch)
+    keys = tuple(gauge["counter_key"] for gauge in gauges)
+    monkeypatch.setattr(handler, "parallel_release_script", None)
+    with pytest.raises(RuntimeError, match="Redis cluster parallel release script is unavailable"):
+        await handler._release_cluster_parallel_slots(keys, "owner", None)
+    # Every shard group is still attempted; the first shard's error is the one re-raised.
+    assert [operation for operation, _ in transport.calls] == []
+
+
+@pytest.mark.asyncio
+async def test_cluster_rollback_swallows_release_failure_and_logs(monkeypatch, caplog):
+    handler, transport, gauges = _cluster_parallel_fixture(monkeypatch)
+    keys = tuple(gauge["counter_key"] for gauge in gauges)
+    assert (await handler._check_parallel_request_gauges(gauges, "owner"))["overall_code"] == "OK"
+    transport.fail = ("release", keys[0])
+    await handler._rollback_cluster_parallel_slots(keys, "owner", None)
+    # The admission error must not be replaced by an unreachable compensation shard: the rollback
+    # exception is retrieved, reported once, and swallowed so the caller keeps its original failure.
+    assert "Could not roll back all Redis cluster parallel request slots" in caplog.text
+    released = {key for operation, group in transport.calls if operation == "release" for key in group}
+    assert released == set(keys)
+    transport.fail = None
+    assert "owner" not in transport.members[keys[1]]
+
+
+# Note: _renew_realtime_call_slot's in-memory "return False" isinstance guard after the any() scan is
+# unreachable for any real cache state (the scan rejects non-dict values first), so no test drives it.

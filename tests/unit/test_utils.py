@@ -847,6 +847,7 @@ def test_aaamodel_prices_and_context_window_json_is_valid():
                 "supports_bedrock_native_structured_output": {"type": "boolean"},
                 "cache_creation_input_audio_token_cost": {"type": "number"},
                 "cache_creation_input_token_cost": {"type": "number"},
+                "cache_creation_input_token_cost_ultrafast": {"type": "number"},
                 "cache_creation_input_token_cost_above_1hr": {"type": "number"},
                 "cache_creation_input_token_cost_above_32k_tokens": {"type": "number"},
                 "cache_creation_input_token_cost_above_100k_tokens": {"type": "number"},
@@ -855,16 +856,16 @@ def test_aaamodel_prices_and_context_window_json_is_valid():
                 "cache_creation_input_token_cost_above_200k_tokens": {"type": "number"},
                 "cache_creation_input_token_cost_above_256k_tokens": {"type": "number"},
                 "cache_creation_input_token_cost_above_272k_tokens": {"type": "number"},
-                "cache_creation_input_token_cost_above_272k_tokens_flex": {"type": "number"},
                 "cache_creation_input_token_cost_above_272k_tokens_ultrafast": {"type": "number"},
+                "cache_creation_input_token_cost_above_272k_tokens_flex": {"type": "number"},
                 "cache_creation_input_token_cost_above_272k_tokens_priority": {"type": "number"},
                 "cache_creation_input_token_cost_above_200k_tokens_batches": {"type": "number"},
                 "cache_creation_input_token_cost_above_272k_tokens_batches": {"type": "number"},
                 "cache_creation_input_token_cost_batches": {"type": "number"},
                 "cache_creation_input_token_cost_flex": {"type": "number"},
                 "cache_creation_input_token_cost_priority": {"type": "number"},
-                "cache_creation_input_token_cost_ultrafast": {"type": "number"},
                 "cache_read_input_token_cost": {"type": "number"},
+                "cache_read_input_token_cost_ultrafast": {"type": "number"},
                 "cache_read_input_token_cost_above_32k_tokens": {"type": "number"},
                 "cache_read_input_token_cost_above_100k_tokens": {"type": "number"},
                 "cache_read_input_token_cost_above_100k_tokens_batches": {"type": "number"},
@@ -873,10 +874,9 @@ def test_aaamodel_prices_and_context_window_json_is_valid():
                 "cache_read_input_token_cost_above_200k_tokens_batches": {"type": "number"},
                 "cache_read_input_token_cost_above_256k_tokens": {"type": "number"},
                 "cache_read_input_token_cost_above_272k_tokens": {"type": "number"},
-                "cache_read_input_token_cost_above_272k_tokens_flex": {"type": "number"},
                 "cache_read_input_token_cost_above_272k_tokens_ultrafast": {"type": "number"},
+                "cache_read_input_token_cost_above_272k_tokens_flex": {"type": "number"},
                 "cache_read_input_token_cost_above_512k_tokens": {"type": "number"},
-                "input_cost_per_token_above_272k_tokens_ultrafast": {"type": "number"},
                 "cache_read_input_token_cost_batches": {"type": "number"},
                 "cache_read_input_token_cost_above_272k_tokens_batches": {"type": "number"},
                 "cache_creation_input_token_cost_above_1hr_above_100k_tokens": {"type": "number"},
@@ -902,11 +902,11 @@ def test_aaamodel_prices_and_context_window_json_is_valid():
                 "input_cost_per_token_above_200k_tokens_batches": {"type": "number"},
                 "input_cost_per_token_above_256k_tokens": {"type": "number"},
                 "input_cost_per_token_above_272k_tokens": {"type": "number"},
+                "input_cost_per_token_above_272k_tokens_ultrafast": {"type": "number"},
                 "input_cost_per_token_above_512k_tokens": {"type": "number"},
                 "cache_read_input_token_cost_flex": {"type": "number"},
                 "cache_read_input_token_cost_priority": {"type": "number"},
                 "cache_read_input_token_cost_balanced": {"type": "number"},
-                "cache_read_input_token_cost_ultrafast": {"type": "number"},
                 "cache_read_input_token_cost_above_200k_tokens_priority": {"type": "number"},
                 "cache_read_input_token_cost_above_272k_tokens_priority": {"type": "number"},
                 "input_cost_per_token_flex": {"type": "number"},
@@ -1118,6 +1118,8 @@ def test_aaamodel_prices_and_context_window_json_is_valid():
                             "/v1/messages",
                             "/v1/images/generations",
                             "/v1/realtime",
+                            "/v1/realtime/calls",
+                            "/v1/live",
                             "/v1/realtime/transcription_sessions",
                             "/v1/images/variations",
                             "/v1/images/edits",
@@ -1410,7 +1412,11 @@ def test_openai_models_in_model_info(monkeypatch):
     model_map = litellm.model_cost
     violated_models = []
     for model, info in model_map.items():
-        if info.get("litellm_provider") == "openai" and info.get("supports_vision") is True:
+        if (
+            info.get("litellm_provider") == "openai"
+            and info.get("supports_vision") is True
+            and info.get("mode") != "image_generation"
+        ):
             if info.get("supports_pdf_input") is not True:
                 violated_models.append(model)
     assert len(violated_models) == 0, f"The following models should support pdf input: {violated_models}"
