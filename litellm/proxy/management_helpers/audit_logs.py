@@ -211,10 +211,15 @@ async def create_audit_log_for_update(request_data: LiteLLM_AuditLogs):
     if not is_audit_logging_enabled():
         return
 
-    from litellm.proxy.proxy_server import premium_user, prisma_client
-
-    if premium_user is not True:
-        return
+    # SC-2507 (pocharlies): el gate premium de upstream se quita para la escritura
+    # en DB. La garantia que necesita la compania es de procedencia: quien bloquea
+    # una virtual key (endpoint admin /key/block) debe quedar en LiteLLM_AuditLog
+    # con changed_by y changed_by_api_key. Medido 28-10 con la auditoria activada
+    # (LITELLM_STORE_AUDIT_LOGS=true, PR k8s-litellm-pocharlies#311): sin este quite
+    # la tabla queda a 0 filas para siempre y el bloqueo de aurora-rca del 10/10 no
+    # tuvo rastro durante 6 dias. El gate de activacion (is_audit_logging_enabled)
+    # sigue intacto: esto no enciende nada por si solo.
+    from litellm.proxy.proxy_server import prisma_client
 
     verbose_proxy_logger.debug("creating audit log for %s", request_data)
 
