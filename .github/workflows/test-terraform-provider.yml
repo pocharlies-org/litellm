@@ -23,6 +23,8 @@ concurrency:
 
 jobs:
   provider-checks:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     name: gofmt, vet, build, test
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -58,6 +60,8 @@ jobs:
         run: go test -timeout 120s ./...
 
   endpoint-drift:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     name: Provider endpoints vs proxy OpenAPI schema
     runs-on: ubuntu-latest
     timeout-minutes: 20

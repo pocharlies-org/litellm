@@ -26,6 +26,8 @@ permissions: {}
 
 jobs:
   create-branch:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     name: Create Release Branch
     runs-on: ubuntu-latest
     permissions:

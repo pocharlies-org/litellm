@@ -13,7 +13,8 @@ jobs:
   analysis:
     name: Scorecard analysis
     runs-on: ubuntu-latest
-    if: github.event.repository.default_branch == github.ref_name
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm' && github.event.repository.default_branch == github.ref_name
     permissions:
       security-events: write
       id-token: write

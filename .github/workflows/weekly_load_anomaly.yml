@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   weekly-load-anomaly:
-    if: github.event_name != 'schedule' || github.repository == 'BerriAI/litellm'
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:

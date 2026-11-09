@@ -27,7 +27,8 @@ concurrency:
 
 jobs:
   comment-fixed-issue-tests:
-    if: github.event_name == 'pull_request'
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm' && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

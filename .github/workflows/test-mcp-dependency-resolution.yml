@@ -40,6 +40,8 @@ concurrency:
 
 jobs:
   resolve:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -121,6 +123,8 @@ jobs:
           done
 
   core-distribution:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     permissions:
       contents: read
       id-token: write

@@ -20,6 +20,8 @@ concurrency:
 
 jobs:
   lint-pr-title:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     name: Validate PR title
     runs-on: ubuntu-latest
     steps:

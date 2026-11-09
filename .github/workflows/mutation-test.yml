@@ -22,6 +22,8 @@ concurrency:
 
 jobs:
   mutation:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     name: Run mutmut
     runs-on: ubuntu-latest
     # Whole-folder mutation against ~15 files / ~7.5k LOC can take hours.

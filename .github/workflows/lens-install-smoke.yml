@@ -25,6 +25,8 @@ concurrency:
 
 jobs:
   build-images:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     runs-on: ubuntu-latest-16-cores
     timeout-minutes: 45
     strategy:
@@ -87,6 +89,8 @@ jobs:
           overwrite: true
 
   helm-install:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     needs: build-images
     runs-on: ubuntu-latest-16-cores
     timeout-minutes: 25
