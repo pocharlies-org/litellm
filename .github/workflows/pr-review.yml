@@ -1,0 +1,63 @@
+# Revision automatica de pull requests con PR-Agent 0.46.0 (INFRA-298, F4).
+#
+# Copia este fichero tal cual a `.github/workflows/pr-review.yml` de tu repo.
+#
+# El motor es `pr-agent` y se fija AQUI con `with:` (INFRA-334): el default del
+# reusable es otro motor y la plantilla no depende de el. La implementacion vive
+# en el repo del framework, no aqui:
+#   pocharlies-org/k8s-gitops-pocharlies
+#     .github/workflows/reusable-pr-review.yml           <- orquestacion (job `Review del PR (PR-Agent)`)
+#     scripts/review-context.py y review-distribute.py   <- contexto y distribucion
+#     .pr_agent.toml                                     <- configuracion montada del motor
+#   Runbook: docs/ci-pr-review.md.
+#
+# Secretos POR REPO (plan `free`: los de organizacion no llegan a los privados,
+# INFRA-331), repartidos con scripts/review-distribute-secrets.sh --from-op
+# k8s-pocharlies/pr-review-ci:
+#   PR_AGENT_LITELLM_KEY        key `pr-agent-ci` de LiteLLM; sin ella el motor
+#                               no se lanza y el check queda en verde con `status: skipped`.
+#   HARBOR_USER / HARBOR_PASSWORD  pull de la imagen de Harbor (por digest); sin
+#                               ellos, lo mismo.
+#   JIRA_EMAIL / JIRA_API_TOKEN  cumplimiento del ticket; sin ellos la seccion
+#                               va a «Degradaciones».
+#   BRAIN_CI_KEY                escritura en el brain local-ops; sin ella, degradada.
+#   HINDSIGHT_WRITER_TOKEN      escritura en Hindsight (banco `ops`); sin el, degradada.
+# TELEGRAM_CI_BOT_TOKEN y TELEGRAM_CI_CHAT_ID son de organizacion y entran con
+# `secrets: inherit` solo en repos PUBLICOS.
+#
+# El check NO bloquea (D3): rojo solo por credencial rota (401/403) o uso
+# invalido del motor; modelo caido, cola, timeout o secreto sin configurar =
+# verde con aviso y `status` degraded o skipped en el payload.
+#
+# `workflow_dispatch` con este motor no ejecuta ninguna review (el modo de
+# validar el repo sin PR comentando el ultimo commit era del motor anterior);
+# el check queda en verde.
+#
+# `pull_request` a proposito, NUNCA `pull_request_target`: el segundo ejecuta
+# con los secretos del repo base sobre codigo de un fork.
+name: PR review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+jobs:
+  review:
+    # El bloque va AQUI y no solo en el workflow reutilizable: la organizacion
+    # tiene `default_workflow_permissions: read` y un workflow llamado solo
+    # puede REBAJAR los permisos de quien lo llama, nunca ampliarlos. Sin esto
+    # el comentario se va en 403 y parece que el bot no encontro nada.
+    permissions:
+      contents: read
+      pull-requests: write
+      # PR-Agent no empuja codigo (restricted_mode): `contents: write` no hace
+      # falta y no se pide.
+    uses: pocharlies-org/k8s-gitops-pocharlies/.github/workflows/reusable-pr-review.yml@main
+    with:
+      # Motor nuevo (INFRA-334, F4): PR-Agent orquestado en tres pasos
+      # (contexto, PR-Agent con la imagen de Harbor por digest, distribucion
+      # con el contrato pr_review.v1). Los pilotos lo fijaron en F1 (INFRA-332);
+      # la plantilla lo fija para todo repo que la copie a partir de ahora.
+      engine: pr-agent
+    secrets: inherit
