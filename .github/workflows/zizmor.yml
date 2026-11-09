@@ -16,6 +16,8 @@ permissions: {}
 
 jobs:
   zizmor:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     name: zizmor
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -79,6 +79,8 @@ env:
 
 jobs:
   rust-lint:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -102,6 +104,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   rust-test:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Trim debuginfo to keep the job's target dir within the runner's disk
@@ -164,6 +168,8 @@ jobs:
           done
 
   rust-wheel:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

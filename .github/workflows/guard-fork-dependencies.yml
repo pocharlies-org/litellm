@@ -22,7 +22,8 @@ jobs:
     name: Block fork dependency changes
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    if: github.event.pull_request.head.repo.full_name != github.repository
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm' && github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - name: Checkout base branch
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0

@@ -21,7 +21,8 @@ permissions: {}
 
 jobs:
   flag-tests:
-    if: github.event_name == 'pull_request'
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm' && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -115,7 +116,8 @@ jobs:
 
   flag:
     needs: classify
-    if: needs.classify.outputs.verdict != ''
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm' && needs.classify.outputs.verdict != ''
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

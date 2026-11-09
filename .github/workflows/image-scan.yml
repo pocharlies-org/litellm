@@ -48,9 +48,12 @@ jobs:
   image-scan:
     name: image-scan
     runs-on: ubuntu-latest
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
     if: >-
+      github.repository == 'BerriAI/litellm' && (
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
+      )
     timeout-minutes: 30
     permissions:
       contents: read
@@ -113,9 +116,12 @@ jobs:
   runtime-image:
     name: runtime-image (${{ matrix.dockerfile }})
     runs-on: ubuntu-latest
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
     if: >-
+      github.repository == 'BerriAI/litellm' && (
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
+      )
     timeout-minutes: 45
     permissions:
       contents: read
@@ -151,9 +157,12 @@ jobs:
   migrations-image:
     name: migrations-image
     runs-on: ubuntu-latest
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
     if: >-
+      github.repository == 'BerriAI/litellm' && (
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
+      )
     timeout-minutes: 30
     permissions:
       contents: read
@@ -182,9 +191,12 @@ jobs:
   gateway-image:
     name: gateway-image
     runs-on: ubuntu-latest
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
     if: >-
+      github.repository == 'BerriAI/litellm' && (
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
+      )
     timeout-minutes: 30
     permissions:
       contents: read
@@ -213,9 +225,12 @@ jobs:
   ui-image:
     name: ui-image
     runs-on: ubuntu-latest
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
     if: >-
+      github.repository == 'BerriAI/litellm' && (
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
+      )
     timeout-minutes: 30
     permissions:
       contents: read
@@ -242,9 +257,12 @@ jobs:
   backend-image:
     name: backend-image
     runs-on: ubuntu-latest
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
     if: >-
+      github.repository == 'BerriAI/litellm' && (
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
+      )
     timeout-minutes: 30
     permissions:
       contents: read

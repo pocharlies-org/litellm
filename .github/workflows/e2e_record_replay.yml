@@ -20,10 +20,13 @@ permissions:
 jobs:
   record:
     name: "Record the e2e suite against real providers"
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
     if: >-
+      github.repository == 'BerriAI/litellm' && (
       (github.event_name != 'schedule' || github.repository == 'BerriAI/litellm') &&
       (github.event.schedule == '0 8 * * 6' ||
        (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'record'))
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
@@ -114,10 +117,13 @@ jobs:
 
   replay:
     name: "Replay the e2e suite from the pinned bundle with zero egress"
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
     if: >-
+      github.repository == 'BerriAI/litellm' && (
       (github.event_name != 'schedule' || github.repository == 'BerriAI/litellm') &&
       (github.event.schedule == '0 8 * * 1-5' ||
        (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'replay'))
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:

@@ -15,6 +15,8 @@ concurrency:
 
 jobs:
   python:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     name: python
     permissions:
       contents: read
@@ -225,6 +227,8 @@ jobs:
         run: |
           uv run --no-sync python -c "from litellm import *" || (echo '🚨 import failed, this means you introduced unprotected imports! 🚨'; exit 1)
   secret-scan:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -261,6 +265,8 @@ jobs:
             echo "GITGUARDIAN_API_KEY not set, skipping ggshield scan"
           fi
   ui:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     name: ui
     permissions:
       contents: read
@@ -354,6 +360,8 @@ jobs:
         if: ${{ !cancelled() && steps.changed.outputs.has_files == 'true' }}
         run: npm run knip:ci
   ui-api-types:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     name: ui-api-types
     permissions:
       contents: read
@@ -474,6 +482,8 @@ jobs:
           fi
           echo "schema.d.ts is in sync with the proxy OpenAPI spec."
   code-quality:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     name: code-quality
     permissions:
       contents: read
@@ -642,6 +652,8 @@ jobs:
       - name: documentation_test_api_docs
         run: uv run --no-sync python ./tests/documentation_tests/test_api_docs.py
   ci-coverage:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     name: ci-coverage
     permissions:
       contents: read
@@ -668,6 +680,8 @@ jobs:
       - name: Assert .github/workflows/ holds only workflows, correctly named
         run: python .github/scripts/assert_workflow_dir_hygiene.py
   semgrep:
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm'
     name: semgrep
     permissions:
       contents: read
@@ -693,7 +707,8 @@ jobs:
   lint-passed:
     name: lint passed
     needs: [python, secret-scan, ui, ui-api-types, code-quality, ci-coverage, semgrep]
-    if: always()
+    # INFRA-1218: job del upstream BerriAI/litellm; queda skipped en el fork
+    if: github.repository == 'BerriAI/litellm' && always()
     runs-on: ubuntu-latest
     timeout-minutes: 2
     permissions: {}
