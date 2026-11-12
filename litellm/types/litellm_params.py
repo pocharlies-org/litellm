@@ -89,6 +89,7 @@ class ProviderConnection:
     litellm_credential_name: str | None = None
     configurable_clientside_auth_params: "Sequence[str | ConfigurableClientsideParamsCustomAuth] | None" = None
     use_xai_oauth: bool | None = None
+    chatgpt_auth_file: str | None = None
     fireworks_forward_user_id: bool | None = None
     # ChatGPT OAuth deployment options; read from litellm_params by the ChatGPT
     # adapters and listed as owned so they are never swept into extra_body.
