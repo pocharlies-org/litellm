@@ -64,11 +64,23 @@ from litellm.types.realtime import RealtimeQueryParams
 from litellm.types.router import GenericLiteLLMParams
 
 
+class _UnsupervisedCall(HTTPException):
+    """The upstream call exists but its sideband was refused; it must not be hung up."""
+
+
 async def supervise_codex_call(
     request: Request, call: CodexRealtimeCall, auth: UserAPIKeyAuth, lease: RealtimeCallLease | None = None
-) -> None:
+) -> bool:
+    """False when the call runs unsupervised: the caller keeps the lease and budget, so they are returned."""
     with isolated_request_stash():
-        await _start_codex_supervisor(request, call, auth, lease)
+        try:
+            await _start_codex_supervisor(request, call, auth, lease)
+        except _UnsupervisedCall:
+            verbose_proxy_logger.warning(
+                "Realtime call %s runs unsupervised: upstream refused the sideband", call.alias
+            )
+            return False
+    return True
 
 
 async def _start_codex_supervisor(
@@ -155,7 +167,15 @@ async def _start_codex_supervisor(
         )
         effective_handler = handler
         api_base: Final = ChatGPTRealtime.get_api_base(call.api_base)
-        connection: Final = await handler.open_call_connection(call.model, api_base)
+        from websockets.exceptions import InvalidStatus
+
+        try:
+            connection: Final = await handler.open_call_connection(call.model, api_base)
+        except InvalidStatus as exc:
+            # ChatGPT OAuth: the Codex backend answers the call but refuses its sideband socket with 403.
+            if exc.response.status_code == 403:
+                raise _UnsupervisedCall(502, "ChatGPT refused the realtime call sideband") from exc
+            raise
         sockets.push_async_callback(connection.close)
 
         async def close_call() -> None:
@@ -180,6 +200,8 @@ async def _start_codex_supervisor(
         supervision_owned = True
         sockets.pop_all()
         await CALL_SUPERVISORS.start(supervisor)
+    except _UnsupervisedCall:
+        raise
     except BaseException:
         if not supervision_owned:
             try:
@@ -416,11 +438,12 @@ async def _create_codex_realtime_call(request: Request) -> Response:
         )
         token: Final = encode_call(supervised_call)
         supervision_started = True
-        if call_lease is None:
-            await supervise_codex_call(request, supervised_call, auth)
-        else:
-            await supervise_codex_call(request, supervised_call, auth, call_lease)
-            lease_transferred = True
+        supervised: Final = await (
+            supervise_codex_call(request, supervised_call, auth)
+            if call_lease is None
+            else supervise_codex_call(request, supervised_call, auth, call_lease)
+        )
+        supervision_started = lease_transferred = supervised  # unsupervised: this request frees budget and lease
         return Response(
             response.content,
             status_code=response.status_code,
