@@ -2390,3 +2390,65 @@ async def test_websocket_close_after_asgi_completion_is_swallowed(monkeypatch, s
     await live.websocket_live_session(websocket)
 
     assert sent == []
+
+
+def _refused_attach(status):
+    from websockets.datastructures import Headers
+    from websockets.exceptions import InvalidStatus
+    from websockets.http11 import Response as WebSocketResponse
+
+    return InvalidStatus(WebSocketResponse(status, "Forbidden", Headers(), b""))
+
+
+def _supervisor_with_refused_attach(monkeypatch, provider, status):
+    original = live._new_handle(
+        "sess_upstream",
+        "voice",
+        LiveDeployment(model="gpt-live-1-codex", provider=provider),
+        UserAPIKeyAuth(api_key="owner"),
+        None,
+    )
+    logger = Mock(litellm_params={}, model_call_details={})
+    monkeypatch.setattr(live, "process_codex_request", AsyncMock(return_value=({"model": "voice"}, logger)))
+    transport = SimpleNamespace(
+        connect=AsyncMock(side_effect=_refused_attach(status)), request=AsyncMock(return_value=httpx.Response(200))
+    )
+    monkeypatch.setattr(live, "LiveTransport", Mock(return_value=transport))
+    request = Request({"type": "http", "method": "POST", "path": "/v1/live/sessions", "headers": []})
+    return original, transport, request
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_refused_attach_leaves_the_session_up_and_unsupervised(monkeypatch):
+    original, transport, request = _supervisor_with_refused_attach(monkeypatch, "chatgpt", 403)
+    with pytest.raises(live._UnsupervisedLive):
+        await live._start_supervisor(request, original, UserAPIKeyAuth(api_key="owner"), None)
+    transport.request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("provider", "status"), [("openai", 403), ("chatgpt", 500)])
+async def test_other_refused_attaches_still_hang_up(monkeypatch, provider, status):
+    from websockets.exceptions import InvalidStatus
+
+    original, transport, request = _supervisor_with_refused_attach(monkeypatch, provider, status)
+    with pytest.raises(InvalidStatus):
+        await live._start_supervisor(request, original, UserAPIKeyAuth(api_key="owner"), None)
+    transport.request.assert_awaited_once()
+
+
+def test_unsupervised_create_returns_the_session_and_keeps_lease_with_precall(route_client, monkeypatch):
+    prepared = []
+
+    @asynccontextmanager
+    async def precall(request, auth, model, **kwargs):
+        prepared.append(live._Prepared({"model": model}, Mock(), None, kwargs.get("ownership")))
+        yield prepared[-1]
+
+    monkeypatch.setattr(live, "_precall", precall)
+    route_client.supervised.side_effect = live._UnsupervisedLive(502, "refused")
+    body = {"session": {"model": "voice"}, "transport": {"type": "webrtc", "sdp": "offer"}}
+    result = route_client.client.post("/v1/live/sessions", json=body)
+    assert result.status_code == 201
+    assert result.json()["transport"] == {"type": "webrtc", "sdp": "answer"}
+    assert not prepared[0].transferred
