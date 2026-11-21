@@ -1141,11 +1141,27 @@ async def _precall(
                     )
 
 
+class _UnsupervisedLive(HTTPException):
+    """The upstream session exists but its supervision socket was refused; it must not be hung up."""
+
+
 async def _supervise(
     request: Request, handle: LiveHandle, auth: UserAPIKeyAuth, logger: Logging, lease: RealtimeCallLease | None
 ) -> RealTimeStreaming:
     with isolated_request_stash():
         return await _start_supervisor(request, handle, auth, lease)
+
+
+async def _supervised(
+    request: Request, handle: LiveHandle, auth: UserAPIKeyAuth, logger: Logging, lease: RealtimeCallLease | None
+) -> bool:
+    """False when the session runs unsupervised: the caller keeps the lease and budget, so they are returned."""
+    try:
+        await _supervise(request, handle, auth, logger, lease)
+    except _UnsupervisedLive:
+        verbose_proxy_logger.warning("Live session %s runs unsupervised: upstream refused the attach", handle.alias)
+        return False
+    return True
 
 
 async def _start_supervisor(
@@ -1205,7 +1221,15 @@ async def _start_supervisor(
             ),
             custom_llm_provider=deployment.provider,
         )
-        state.connection = await transport.connect(live_session_path(handle.session_id, "attach"))
+        from websockets.exceptions import InvalidStatus
+
+        try:
+            state.connection = await transport.connect(live_session_path(handle.session_id, "attach"))
+        except InvalidStatus as exc:
+            # ChatGPT OAuth: the Codex backend creates the session but refuses its attach socket with 403.
+            if deployment.provider == "chatgpt" and exc.response.status_code == 403:
+                raise _UnsupervisedLive(502, "ChatGPT Live refused the supervision attach") from exc
+            raise
 
         async def receive() -> Message:
             return _mutable(MappingProxyType({"type": "websocket.disconnect", "code": 1000}))
@@ -1242,6 +1266,8 @@ async def _start_supervisor(
         )
         await CALL_SUPERVISORS.start(supervisor)
         return stream
+    except _UnsupervisedLive:
+        raise
     except BaseException:
         from litellm.proxy.spend_tracking.budget_reservation import (
             invalidate_budget_reservation_counters,  # pyright: ignore[reportUnknownVariableType]  # reservation helper has a legacy dict contract
@@ -1337,8 +1363,8 @@ async def _create(request: Request, token: str | None = None) -> Response:
                 initialization_seconds=15,
                 policy=_session_policy(_processed_body(body, prepared.processed), source),
             )
-            await _supervise(request, handle, ownership.auth, prepared.logger, prepared.lease)
-            prepared.transfer()
+            if await _supervised(request, handle, ownership.auth, prepared.logger, prepared.lease):
+                prepared.transfer()
             return _response(response, handle)
 
 
@@ -1431,8 +1457,8 @@ async def _incoming_sip(
             prepared.lease,
             policy=_session_policy(_processed_body(body, prepared.processed), None),
         )
-        await _supervise(request, handle, ownership.auth, prepared.logger, prepared.lease)
-        prepared.transfer()
+        if await _supervised(request, handle, ownership.auth, prepared.logger, prepared.lease):
+            prepared.transfer()
         return Response(
             response.content,
             status_code=response.status_code,
