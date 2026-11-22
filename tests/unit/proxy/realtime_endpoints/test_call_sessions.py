@@ -797,8 +797,8 @@ async def test_sideband_pre_call_block_prevents_upstream_connection(monkeypatch)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("observer_fails", [False, True])
-async def test_signaling_transfers_reservation_only_to_ready_observer(monkeypatch, observer_fails):
+@pytest.mark.parametrize("observer", ["ready", "fails", "unsupervised"])
+async def test_signaling_transfers_reservation_only_to_ready_observer(monkeypatch, observer):
     import json
     from unittest.mock import AsyncMock
 
@@ -833,9 +833,10 @@ async def test_signaling_transfers_reservation_only_to_ready_observer(monkeypatc
         assert owner is auth
         assert not owner.budget_reservation["finalized"]
         assert call.usage_supervised
-        if observer_fails:
+        if observer == "fails":
             await codex.release_or_invalidate_budget_reservation(budget_reservation=owner.budget_reservation)
             raise RuntimeError("Observer unavailable")
+        return observer == "ready"
 
     monkeypatch.setattr(codex, "supervise_codex_call", supervise)
 
@@ -852,13 +853,13 @@ async def test_signaling_transfers_reservation_only_to_ready_observer(monkeypatc
         },
         receive,
     )
-    if observer_fails:
+    if observer == "fails":
         with pytest.raises(RuntimeError, match="Observer unavailable"):
             await codex.create_codex_realtime_call(request)
     else:
         assert (await codex.create_codex_realtime_call(request)).status_code == 201
     assert process.await_args.args[2].budget_reservation is None
-    assert auth.budget_reservation["finalized"] is observer_fails
+    assert auth.budget_reservation["finalized"] is (observer != "ready")
 
 
 @pytest.mark.asyncio
@@ -892,6 +893,61 @@ async def test_supervisor_policy_failure_hangs_up_before_releasing(monkeypatch):
         await codex.supervise_codex_call(request, call, auth)
     assert error.value.status_code == 403
     assert closed == ["https://gateway.test/v1"]
+    assert auth.budget_reservation["finalized"]
+
+
+def _supervisor_with_refused_sideband(monkeypatch, status):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from fastapi import Request
+    from websockets.datastructures import Headers
+    from websockets.exceptions import InvalidStatus
+    from websockets.http11 import Response as WebSocketResponse
+
+    call = CodexRealtimeCall(
+        call_id="rtc_open", model="gpt-live-1-codex", alias="voice", owner="owner", expires_at=time.time() + 60
+    )
+    auth = UserAPIKeyAuth(budget_reservation={"reserved_cost": 0.5, "finalized": False, "entries": []})
+    logger = MagicMock()
+    logger.litellm_params = {}
+    monkeypatch.setattr(codex, "process_codex_request", AsyncMock(return_value=({}, logger)))
+    hangups = []
+
+    class Handler:
+        def __init__(self, *args):
+            pass
+
+        @staticmethod
+        def get_api_base(base):
+            return "https://gateway.test/v1"
+
+        async def open_call_connection(self, model, base):
+            raise InvalidStatus(WebSocketResponse(status, "Refused", Headers(), b""))
+
+        async def hangup_call(self, base):
+            hangups.append(base)
+
+    monkeypatch.setattr(codex, "ChatGPTRealtime", Handler)
+    request = Request({"type": "http", "headers": [], "method": "POST", "path": "/v1/realtime/calls"})
+    return request, call, auth, hangups
+
+
+@pytest.mark.asyncio
+async def test_refused_sideband_leaves_the_call_up_and_unsupervised(monkeypatch):
+    request, call, auth, hangups = _supervisor_with_refused_sideband(monkeypatch, 403)
+    assert await codex.supervise_codex_call(request, call, auth) is False
+    assert hangups == []
+    assert not auth.budget_reservation["finalized"]
+
+
+@pytest.mark.asyncio
+async def test_other_refused_sidebands_still_hang_up(monkeypatch):
+    from websockets.exceptions import InvalidStatus
+
+    request, call, auth, hangups = _supervisor_with_refused_sideband(monkeypatch, 500)
+    with pytest.raises(InvalidStatus):
+        await codex.supervise_codex_call(request, call, auth)
+    assert hangups == ["https://gateway.test/v1"]
     assert auth.budget_reservation["finalized"]
 
 
@@ -1059,7 +1115,9 @@ async def test_attachment_releases_quota_before_upstream_close_handshake(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "provider", "observer", "renewal", "legacy_key", "legacy_global"])
+@pytest.mark.parametrize(
+    "failure", [None, "unsupervised", "provider", "observer", "renewal", "legacy_key", "legacy_global"]
+)
 async def test_signaling_keeps_or_releases_owned_call_lease(monkeypatch, failure):
     import json
     from unittest.mock import AsyncMock, MagicMock
@@ -1113,6 +1171,7 @@ async def test_signaling_keeps_or_releases_owned_call_lease(monkeypatch, failure
         assert call.parallel_reserved
         if failure == "observer":
             raise RuntimeError("Observer unavailable")
+        return failure is None
 
     monkeypatch.setattr(server, "route_request", route)
     monkeypatch.setattr(codex, "supervise_codex_call", supervise)
@@ -1136,6 +1195,13 @@ async def test_signaling_keeps_or_releases_owned_call_lease(monkeypatch, failure
         token = response.headers["location"].rsplit("/", 1)[-1]
         assert codex.decode_call(token, "Bearer owner").parallel_reserved
         lease.close.assert_not_awaited()
+    elif failure == "unsupervised":
+        response = await codex.create_codex_realtime_call(request)
+        assert response.status_code == 201
+        call = codex.decode_call(response.headers["location"].rsplit("/", 1)[-1], "Bearer owner")
+        assert not call.parallel_reserved
+        assert not call.usage_supervised
+        lease.close.assert_awaited_once()
     else:
         with pytest.raises((RuntimeError, HTTPException)) as raised:
             await codex.create_codex_realtime_call(request)
