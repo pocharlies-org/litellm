@@ -1196,7 +1196,11 @@ async def test_signaling_keeps_or_releases_owned_call_lease(monkeypatch, failure
         assert codex.decode_call(token, "Bearer owner").parallel_reserved
         lease.close.assert_not_awaited()
     elif failure == "unsupervised":
-        assert (await codex.create_codex_realtime_call(request)).status_code == 201
+        response = await codex.create_codex_realtime_call(request)
+        assert response.status_code == 201
+        call = codex.decode_call(response.headers["location"].rsplit("/", 1)[-1], "Bearer owner")
+        assert not call.parallel_reserved
+        assert not call.usage_supervised
         lease.close.assert_awaited_once()
     else:
         with pytest.raises((RuntimeError, HTTPException)) as raised:

@@ -444,12 +444,13 @@ async def _create_codex_realtime_call(request: Request) -> Response:
             else supervise_codex_call(request, supervised_call, auth, call_lease)
         )
         supervision_started = lease_transferred = supervised  # unsupervised: this request frees budget and lease
+        handle: Final = token if supervised else encode_call(call)  # never claim a supervisor or lease it lacks
         return Response(
             response.content,
             status_code=response.status_code,
             media_type="application/sdp",
             headers=MappingProxyType(
-                {"Location": f"/v1/live/{token}" if live_signaling else f"/v1/realtime/calls/{token}"}
+                {"Location": f"/v1/live/{handle}" if live_signaling else f"/v1/realtime/calls/{handle}"}
             ),
         )
     finally:
