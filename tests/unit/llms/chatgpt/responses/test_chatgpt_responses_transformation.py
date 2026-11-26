@@ -69,6 +69,33 @@ class TestChatGPTResponsesAPITransformation:
         )
         assert request["input"] == [user_item, {**system_item, "role": "developer"}]
 
+    def test_codex_additional_tools_item_is_hoisted_into_tools(self) -> None:
+        # Codex 0.172's input[0]; left in `input`, the ChatGPT backend 400s every request.
+        codex_tools: Final = [
+            {
+                "type": "custom",
+                "name": "exec",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: X"},
+            },
+            {
+                "type": "namespace",
+                "name": "functions",
+                "description": "",
+                "tools": [{"type": "function", "name": "wait"}],
+            },
+        ]
+        caller_tool: Final = {"type": "function", "name": "preexisting", "parameters": {"type": "object"}}
+        user_item: Final = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        request: Final = ChatGPTResponsesAPIConfig().transform_responses_api_request(
+            model="gpt-6-luna",
+            input=[{"type": "additional_tools", "id": "at_1", "role": "developer", "tools": codex_tools}, user_item],
+            response_api_optional_request_params={"tools": [caller_tool]},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+        assert request["input"] == [user_item]
+        assert request["tools"] == [caller_tool, *codex_tools]
+
     @pytest.mark.parametrize(
         ("requested_tier", "expected_tier"),
         [("default", "default"), ("priority", "priority"), ("fast", "priority")],
