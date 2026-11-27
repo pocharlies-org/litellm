@@ -11,6 +11,7 @@ from litellm.litellm_core_utils.llm_response_utils.convert_dict_to_response impo
 )
 from litellm.llms.openai.common_utils import OpenAIError
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
+from litellm.responses.additional_tools import hoist_additional_tools
 from litellm.responses.sse_output_recovery import (
     parse_sse_json_chunk,
     record_output_item_chunk,
@@ -18,6 +19,7 @@ from litellm.responses.sse_output_recovery import (
 )
 from litellm.types.llms.openai import (
     ResponseInputParam,
+    ResponsesAPIOptionalRequestParams,
     ResponsesAPIResponse,
     ResponsesAPIStreamEvents,
 )
@@ -98,10 +100,17 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         litellm_params: GenericLiteLLMParams,
         headers: dict,
     ) -> dict:
+        params: Final = cast(  # cast-ok: the base signature leaves the params dict untyped
+            "ResponsesAPIOptionalRequestParams", response_api_optional_request_params
+        )
+        # Codex ships its tools in an `additional_tools` input item, which the ChatGPT backend rejects.
+        hoisted: Final = hoist_additional_tools(input, params.get("tools"))
         request: Final = super().transform_responses_api_request(
             model,
-            [{"role": "user", "content": input}] if isinstance(input, str) else input,
-            response_api_optional_request_params,
+            [{"role": "user", "content": hoisted.input}] if isinstance(hoisted.input, str) else hoisted.input,
+            {**response_api_optional_request_params, "tools": list(hoisted.tools)}
+            if hoisted.hoisted
+            else response_api_optional_request_params,
             litellm_params,
             headers,
         )
